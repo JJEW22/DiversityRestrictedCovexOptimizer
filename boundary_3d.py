@@ -23,35 +23,85 @@ from nash_welfare_optimizer import (
 )
 
 
-def create_test_setup_3d(n_agents: int = 10):
-    """Create a test setup with 3 resources."""
+def create_test_setup_3d(n_agents: int = 10, random_utilities: bool = False, seed: Optional[int] = None):
+    """Create a test setup with 3 resources.
+    
+    Args:
+        n_agents: Number of agents
+        random_utilities: If True, use random utilities instead of hardcoded
+        seed: Random seed for reproducibility (only used if random_utilities=True)
+    """
     n_resources = 3
     
-    # Build utility matrix
-    utilities = np.zeros((n_agents, n_resources))
-    
-    # Non-attackers: different preferences
-    # Split them into groups with different preferences
-    for i in range(n_agents - 1):
-        if i % 3 == 0:
-            utilities[i] = [1.0, 0.0, 0.0]  # Only want R0
-        elif i % 3 == 1:
-            utilities[i] = [0.0, 1.0, 0.0]  # Only want R1
-        else:
-            utilities[i] = [0.0, 0.0, 1.0]  # Only want R2
-    
-    # Attacker (last agent): wants a mix
-    attacker_id = n_agents - 1
-    utilities[attacker_id] = [0.5, 0.3, 0.2]
+    if random_utilities:
+        if seed is not None:
+            np.random.seed(seed)
+        
+        # Generate random utilities using rod-cutting approach
+        utilities = np.zeros((n_agents, n_resources))
+        for i in range(n_agents):
+            cuts = np.sort(np.random.uniform(0, 1, n_resources - 1))
+            cuts = np.concatenate([[0], cuts, [1]])
+            utilities[i] = np.diff(cuts)
+    else:
+        # Build utility matrix with hardcoded values
+        utilities = np.zeros((n_agents, n_resources))
+        
+        # Non-attackers: different preferences
+        # Split them into groups with different preferences
+        for i in range(n_agents - 1):
+            if i % 3 == 0:
+                utilities[i] = [1.0, 0.0, 0.0]  # Only want R0
+            elif i % 3 == 1:
+                utilities[i] = [0.0, 1.0, 0.0]  # Only want R1
+            else:
+                utilities[i] = [0.0, 0.0, 1.0]  # Only want R2
+        
+        # Attacker (last agent): wants a mix
+        attacker_id = n_agents - 1
+        utilities[attacker_id] = [0.5, 0.3, 0.2]
     
     # Supply: 1 unit of each resource
     supply = np.ones(n_resources)
     
-    # Groups
+    # Groups - attacker is always the last agent
+    attacker_id = n_agents - 1
     attacking_group = {attacker_id}
     victim_group = set(range(n_agents - 1))
     
     return utilities, supply, attacking_group, victim_group, attacker_id, n_agents, n_resources
+
+
+def compute_global_optimum_direction(
+    utilities: np.ndarray,
+    supply: np.ndarray,
+    attacking_group: Set[int],
+    n_agents: int,
+    n_resources: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the global optimum (unconstrained Nash welfare) and extract the attacker's direction.
+    
+    Returns:
+        attacker_direction: Normalized direction vector for the attacker's allocation
+        attacker_allocation: The actual allocation for the attacker at the optimum
+    """
+    from nash_welfare_optimizer import NashWelfareOptimizer
+    
+    optimizer = NashWelfareOptimizer(n_agents, n_resources, utilities, supply)
+    result = optimizer.solve()
+    
+    attacker_id = list(attacking_group)[0]
+    attacker_allocation = result.allocation[attacker_id].copy()
+    
+    # Normalize to get direction
+    norm = np.linalg.norm(attacker_allocation)
+    if norm > 1e-10:
+        attacker_direction = attacker_allocation / norm
+    else:
+        attacker_direction = attacker_allocation.copy()
+    
+    return attacker_direction, attacker_allocation
 
 
 def generate_sphere_directions(n_phi: int = 10, n_theta: int = 20, skip_zero_components: bool = False) -> List[Tuple[float, float, np.ndarray]]:
@@ -291,6 +341,37 @@ def compute_ratio_differences(
     return ratio_diffs, attacker_ratios, dependent_ratios, dependent_agents
 
 
+def compute_directional_derivative_at_point(
+    x_full: np.ndarray,
+    V: np.ndarray,
+    utilities: np.ndarray,
+    attacking_group: Set[int],
+    non_attacking_group: Set[int],
+    n_agents: int,
+    n_resources: int,
+    oracle: DirectionalDerivativeOracle
+) -> Optional[float]:
+    """
+    Compute the directional derivative at a given point using the oracle.
+    
+    Returns the directional derivative value, or None if computation fails.
+    """
+    # Use the oracle's method to compute direction
+    forward_direction, forward_valid = oracle._compute_direction(x_full, V, backward=False)
+    
+    if not forward_valid:
+        # Try backward
+        backward_direction, backward_valid = oracle._compute_direction(x_full, V, backward=True)
+        if backward_valid:
+            backward_deriv = oracle._compute_directional_derivative_with_direction(x_full, V, backward_direction)
+            return -backward_deriv  # Negate because it's backward
+        return None
+    
+    # Compute directional derivative using the oracle
+    dir_deriv = oracle._compute_directional_derivative_with_direction(x_full, V, forward_direction)
+    return dir_deriv
+
+
 def probe_direction_3d(
     direction: np.ndarray,
     utilities: np.ndarray,
@@ -360,6 +441,9 @@ def probe_direction_3d(
     # Binary search to find boundary
     t_low, t_high = 0.0, 1.0
     
+    if verbose:
+        print(f"  Binary search for direction {direction.round(4)}:")
+    
     for iteration in range(50):
         t_mid = (t_low + t_high) / 2
         
@@ -372,6 +456,8 @@ def probe_direction_3d(
         )
         
         if non_attacker_alloc_mid is None:
+            if verbose:
+                print(f"    iter {iteration}: t={t_mid:.6f} -> Nash solve failed, t_low <- t_mid")
             t_low = t_mid
             continue
         
@@ -382,18 +468,58 @@ def probe_direction_3d(
         V_mid = np.array([np.dot(utilities[i], x_full_mid[i]) for i in range(n_agents)])
         
         if any(V_mid[i] <= 1e-10 for i in non_attacking_group):
+            if verbose:
+                print(f"    iter {iteration}: t={t_mid:.6f} -> zero utility, t_low <- t_mid")
             t_low = t_mid
             continue
         
         fwd_dir, fwd_valid = oracle._compute_direction(x_full_mid, V_mid, backward=False)
         
         if not fwd_valid:
+            if verbose:
+                print(f"    iter {iteration}: t={t_mid:.6f} -> fwd invalid, t_high <- t_mid")
             t_high = t_mid
             continue
         
         dir_deriv = oracle._compute_directional_derivative_with_direction(x_full_mid, V_mid, fwd_dir)
         
+        # Find dependent agents (agents with negative direction in fwd_dir for each resource)
+        dep_agents = []
+        for j in range(n_resources):
+            deps_for_j = []
+            for i in non_attacking_group:
+                if fwd_dir[i, j] < -1e-10:
+                    deps_for_j.append(i)
+            dep_agents.append(deps_for_j if deps_for_j else None)
+        
+        # Compute ratios for all non-attackers for logging
+        if verbose:
+            print(f"    iter {iteration}: t={t_mid:.6f}, dir_deriv={dir_deriv:.6e}, dep_agents={dep_agents}, t_low={t_low:.6f}, t_high={t_high:.6f}")
+            print(f"      Attacker alloc: {attacker_alloc_mid.round(6)}")
+            print(f"      fwd_dir (non-zero entries):")
+            for i in range(n_agents):
+                if np.any(np.abs(fwd_dir[i]) > 1e-10):
+                    role = "ATK" if i == attacker_id else "VIC"
+                    print(f"        Agent {i} ({role}): {fwd_dir[i].round(8)}")
+            print(f"      Non-attacker ratios (v_ij/V_i) for each resource:")
+            for j in range(n_resources):
+                ratios_for_resource = []
+                for i in non_attacking_group:
+                    V_i = max(V_mid[i], 1e-10)
+                    ratio = utilities[i, j] / V_i
+                    has_alloc = x_full_mid[i, j] > 1e-6  # Match threshold in _compute_direction
+                    ratios_for_resource.append((i, ratio, has_alloc, x_full_mid[i, j]))
+                # Sort by ratio
+                ratios_for_resource.sort(key=lambda x: x[1])
+                print(f"        R{j}: ", end="")
+                for agent, ratio, has_alloc, alloc in ratios_for_resource:
+                    marker = "*" if has_alloc else " "
+                    print(f"A{agent}:{ratio:.10f}{marker}({alloc:.6f}) ", end="")
+                print()
+        
         if abs(dir_deriv) < 1e-8:
+            if verbose:
+                print(f"    -> converged at t={t_mid:.6f}")
             break
         elif dir_deriv > 0:
             t_low = t_mid
@@ -635,7 +761,8 @@ def validate_all_boundary_points(boundary_points: List[np.ndarray],
     return invalidated
 
 
-def plot_boundary_3d(results: List[Tuple[float, float, Dict]], filename: str):
+def plot_boundary_3d(results: List[Tuple[float, float, Dict]], filename: str, 
+                     optimum_result: Optional[Tuple[np.ndarray, np.ndarray, bool]] = None):
     """Plot the boundary points in 3D with normal vectors, colored by validation status."""
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -700,6 +827,21 @@ def plot_boundary_3d(results: List[Tuple[float, float, Dict]], filename: str):
             line_color = 'red' if invalidated[i] else 'blue'
             ax.plot([0, bp[0]], [0, bp[1]], [0, bp[2]], color=line_color, alpha=0.2)
     
+    # Plot global optimum point (yellow if valid, orange if invalidated)
+    if optimum_result is not None:
+        opt_boundary, opt_allocation, opt_invalidated = optimum_result
+        if opt_boundary is not None:
+            opt_color = 'orange' if opt_invalidated else 'yellow'
+            opt_label = 'Global optimum (INVALID)' if opt_invalidated else 'Global optimum (valid)'
+            ax.scatter([opt_boundary[0]], [opt_boundary[1]], [opt_boundary[2]], 
+                      c=opt_color, s=200, marker='*', edgecolors='black', linewidths=1,
+                      label=opt_label, zorder=10)
+            # Draw line from origin to optimum
+            ax.plot([0, opt_boundary[0]], [0, opt_boundary[1]], [0, opt_boundary[2]], 
+                   color=opt_color, linewidth=2, alpha=0.8)
+            print(f"  Global optimum boundary point: {opt_boundary.round(6)}")
+            print(f"  Global optimum invalidated: {opt_invalidated}")
+    
     # Origin
     ax.scatter([0], [0], [0], c='green', s=100, marker='s', label='Origin')
     
@@ -730,6 +872,8 @@ def main():
     parser.add_argument('--n-theta', type=int, default=16, help='Number of theta divisions')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--output-dir', type=str, default='.', help='Output directory')
+    parser.add_argument('--random-utilities', action='store_true', help='Use random utilities instead of hardcoded')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed (only used with --random-utilities)')
     
     args = parser.parse_args()
     
@@ -739,16 +883,30 @@ def main():
     
     # Setup
     utilities, supply, attacking_group, victim_group, attacker_id, n_agents, n_resources = \
-        create_test_setup_3d(args.n_agents)
+        create_test_setup_3d(args.n_agents, random_utilities=args.random_utilities, seed=args.seed)
     
     non_attacking_group = set(range(n_agents)) - attacking_group
     
     print(f"n_agents: {n_agents}")
     print(f"n_resources: {n_resources}")
-    print(f"Attacker (Agent {attacker_id}): utilities = {utilities[attacker_id]}")
+    print(f"random_utilities: {args.random_utilities}")
+    if args.seed is not None:
+        print(f"seed: {args.seed}")
+    print(f"Attacker (Agent {attacker_id}): utilities = {utilities[attacker_id].round(6)}")
     print(f"Non-attacker utilities:")
-    for i in range(min(3, n_agents - 1)):
-        print(f"  Agent {i}: {utilities[i]}")
+    for i in range(min(5, n_agents - 1)):
+        print(f"  Agent {i}: {utilities[i].round(6)}")
+    if n_agents - 1 > 5:
+        print(f"  ... ({n_agents - 1 - 5} more agents)")
+    print()
+    
+    # Compute global optimum direction
+    print("Computing global optimum (unconstrained Nash welfare)...")
+    optimum_direction, optimum_allocation = compute_global_optimum_direction(
+        utilities, supply, attacking_group, n_agents, n_resources
+    )
+    print(f"  Global optimum attacker allocation: {optimum_allocation.round(6)}")
+    print(f"  Global optimum direction: {optimum_direction.round(6)}")
     print()
     
     # Create oracle
@@ -763,11 +921,35 @@ def main():
     
     # Generate directions
     directions = generate_sphere_directions(args.n_phi, args.n_theta)
+    
+    # Check if the global optimum direction is already in the list
+    opt_dir_key = (round(optimum_direction[0], 6), round(optimum_direction[1], 6), round(optimum_direction[2], 6))
+    existing_keys = {}
+    for idx, (_, _, d) in enumerate(directions):
+        key = (round(d[0], 6), round(d[1], 6), round(d[2], 6))
+        existing_keys[key] = idx
+    
+    optimum_direction_idx = None  # Index of optimum direction in results (if it exists)
+    
+    if opt_dir_key not in existing_keys and np.linalg.norm(optimum_direction) > 1e-10:
+        # Add optimum direction with dummy phi/theta
+        directions.append((999.0, 999.0, optimum_direction))  # 999 marks it as the optimum
+        optimum_direction_idx = len(directions) - 1
+        print(f"Added global optimum direction to test set")
+    elif opt_dir_key in existing_keys:
+        optimum_direction_idx = existing_keys[opt_dir_key]
+        print(f"Global optimum direction already in test set at index {optimum_direction_idx}")
+    else:
+        print(f"Global optimum direction has zero norm, skipping")
+    
     print(f"Probing {len(directions)} directions...")
     print()
     
     # Probe each direction
     results = []
+    optimum_result_data = None
+    results_idx_for_optimum = None  # Track which index in results corresponds to optimum
+    
     for idx, (phi, theta, direction) in enumerate(directions):
         if idx % 20 == 0:
             print(f"Progress: {idx}/{len(directions)}")
@@ -784,10 +966,78 @@ def main():
             oracle=oracle,
             verbose=args.verbose
         )
-        results.append((phi, theta, result))
+        
+        # Compute directional derivative at the boundary point
+        if result['boundary_attacker_alloc'] is not None:
+            boundary_alloc = result['boundary_attacker_alloc']
+            remaining_supply = supply - boundary_alloc
+            remaining_supply = np.maximum(remaining_supply, 0)
+            non_attacker_alloc = solve_nash_for_non_attackers_standalone(
+                utilities, non_attacking_group, remaining_supply, n_agents, n_resources
+            )
+            if non_attacker_alloc is not None:
+                x_full = build_full_allocation(boundary_alloc, non_attacker_alloc, attacker_id, n_agents, n_resources)
+                V = np.array([np.dot(utilities[i], x_full[i]) for i in range(n_agents)])
+                
+                dir_deriv = compute_directional_derivative_at_point(
+                    x_full, V, utilities, attacking_group, non_attacking_group, n_agents, n_resources, oracle
+                )
+                result['directional_derivative'] = dir_deriv
+            else:
+                result['directional_derivative'] = None
+        else:
+            result['directional_derivative'] = None
+        
+        # Check if this is the optimum direction (either added with 999.0 or matched existing)
+        is_optimum = (phi == 999.0 and theta == 999.0) or (idx == optimum_direction_idx)
+        
+        if is_optimum:
+            optimum_result_data = result
+            results_idx_for_optimum = len(results) if phi != 999.0 else None
+            print(f"\n*** GLOBAL OPTIMUM DIRECTION RESULT ***")
+            print(f"  Direction: {direction.round(6)}")
+            print(f"  Boundary point: {result['boundary_attacker_alloc']}")
+            print(f"  Violated at max: {result['violated_at_max']}")
+            print(f"  Directional derivative: {result.get('directional_derivative', 'N/A')}")
+            print()
+        
+        # Add to results (even if it's the optimum, so we get its cutting plane)
+        if phi != 999.0:  # Only add regular directions to results
+            results.append((phi, theta, result))
+        else:
+            # For the added optimum direction, still add it to results
+            results.append((phi, theta, result))
     
     print(f"Progress: {len(directions)}/{len(directions)}")
     print()
+    
+    # Check if optimum boundary point is invalidated by other cutting planes
+    optimum_plot_data = None
+    if optimum_result_data is not None and optimum_result_data['boundary_attacker_alloc'] is not None:
+        opt_boundary = optimum_result_data['boundary_attacker_alloc']
+        
+        # Collect all normal vectors from other results
+        all_normals = []
+        all_boundary_points = []
+        for _, _, r in results:
+            if r['boundary_attacker_alloc'] is not None and r['normal_vector'] is not None:
+                all_boundary_points.append(r['boundary_attacker_alloc'])
+                all_normals.append(r['normal_vector'])
+        
+        # Check if optimum is invalidated
+        opt_invalidated = False
+        for bp, nv in zip(all_boundary_points, all_normals):
+            if np.linalg.norm(nv) > 1e-10:
+                # Check if opt_boundary violates the constraint defined by this cutting plane
+                # Constraint: nv · x <= nv · bp
+                rhs = np.dot(nv, bp)
+                lhs = np.dot(nv, opt_boundary)
+                if lhs > rhs + 1e-6:
+                    opt_invalidated = True
+                    break
+        
+        optimum_plot_data = (opt_boundary, optimum_allocation, opt_invalidated)
+        print(f"Global optimum boundary point invalidated by other planes: {opt_invalidated}")
     
     # Save results
     xlsx_filename = f"{args.output_dir}/boundary_probe_3d_n{args.n_agents}.xlsx"
@@ -798,7 +1048,7 @@ def main():
     
     # Plot
     plot_filename = f"{args.output_dir}/boundary_probe_3d_n{args.n_agents}.png"
-    plot_boundary_3d(results, plot_filename)
+    plot_boundary_3d(results, plot_filename, optimum_result=optimum_plot_data)
     
     # Summary
     print()
@@ -810,6 +1060,125 @@ def main():
     print(f"Total directions probed: {len(results)}")
     print(f"Violated at max: {n_violated}")
     print(f"Boundary points found: {n_boundary}")
+    if optimum_plot_data is not None:
+        print(f"Global optimum invalidated: {optimum_plot_data[2]}")
+    
+    # Directional derivative statistics
+    dir_derivs = [r.get('directional_derivative') for _, _, r in results if r.get('directional_derivative') is not None]
+    if dir_derivs:
+        print()
+        print("Directional derivative at boundary points:")
+        print(f"  Count: {len(dir_derivs)}")
+        print(f"  Min: {min(dir_derivs):.6f}")
+        print(f"  Max: {max(dir_derivs):.6f}")
+        print(f"  Mean: {np.mean(dir_derivs):.6f}")
+        print(f"  Std: {np.std(dir_derivs):.6f}")
+        
+        # Count how many are close to zero (should all be ~0 at boundary)
+        near_zero = sum(1 for d in dir_derivs if abs(d) < 1e-4)
+        print(f"  Near zero (|d| < 1e-4): {near_zero}/{len(dir_derivs)}")
+        
+        # Show the worst offenders
+        if any(abs(d) > 1e-4 for d in dir_derivs):
+            print()
+            print("  WARNING: Some boundary points have non-zero directional derivative!")
+            print("  Top 5 largest |dir_deriv|:")
+            sorted_results = sorted([(phi, theta, r) for phi, theta, r in results if r.get('directional_derivative') is not None],
+                                   key=lambda x: abs(x[2].get('directional_derivative', 0)), reverse=True)
+            for phi, theta, r in sorted_results[:5]:
+                dd = r.get('directional_derivative', 0)
+                bp = r.get('boundary_attacker_alloc')
+                print(f"    phi={phi:.1f}, theta={theta:.1f}: dir_deriv={dd:.6f}, boundary={bp.round(4) if bp is not None else None}")
+    
+    # Convexity check
+    print()
+    print("=" * 60)
+    print("CONVEXITY CHECK")
+    print("=" * 60)
+    check_boundary_convexity(results)
+
+
+def check_boundary_convexity(results: List[Tuple[float, float, Dict]]):
+    """
+    Check if the boundary surface is convex.
+    
+    For a convex feasible region, every boundary point should satisfy all cutting planes
+    defined by other boundary points. That is, for each pair of boundary points (p1, p2)
+    with normal n1 at p1, we should have: n1 · p2 <= n1 · p1
+    
+    Also checks that the origin is inside all cutting planes (since origin should be feasible).
+    """
+    # Collect boundary points and their normals
+    boundary_data = []
+    for phi, theta, r in results:
+        if r['boundary_attacker_alloc'] is not None and r['normal_vector'] is not None:
+            bp = r['boundary_attacker_alloc']
+            nv = r['normal_vector']
+            if np.linalg.norm(nv) > 1e-10:
+                boundary_data.append((bp, nv, phi, theta))
+    
+    if len(boundary_data) < 2:
+        print("Not enough boundary points with normals to check convexity")
+        return
+    
+    print(f"Checking {len(boundary_data)} boundary points...")
+    
+    # Check 1: Origin should be inside all cutting planes
+    # Constraint is: n · x <= n · bp, so for origin (x=0): 0 <= n · bp
+    origin_violations = []
+    for bp, nv, phi, theta in boundary_data:
+        rhs = np.dot(nv, bp)
+        if rhs < -1e-6:  # Origin violates this constraint
+            origin_violations.append((phi, theta, bp, nv, rhs))
+    
+    if origin_violations:
+        print(f"\n  WARNING: Origin violates {len(origin_violations)} cutting planes!")
+        print("  This suggests normals may be pointing the wrong direction.")
+        for phi, theta, bp, nv, rhs in origin_violations[:5]:
+            print(f"    phi={phi:.1f}, theta={theta:.1f}: n·bp = {rhs:.6f} < 0")
+            print(f"      boundary={bp.round(4)}, normal={nv.round(4)}")
+    else:
+        print(f"  Origin is inside all {len(boundary_data)} cutting planes: OK")
+    
+    # Check 2: Each boundary point should be inside all OTHER cutting planes
+    # (or on the boundary, i.e., n · p2 <= n · p1 + epsilon)
+    convexity_violations = []
+    for i, (bp1, nv1, phi1, theta1) in enumerate(boundary_data):
+        rhs1 = np.dot(nv1, bp1)
+        for j, (bp2, nv2, phi2, theta2) in enumerate(boundary_data):
+            if i == j:
+                continue
+            lhs = np.dot(nv1, bp2)
+            if lhs > rhs1 + 1e-4:  # bp2 violates the cutting plane from bp1
+                violation = lhs - rhs1
+                convexity_violations.append((i, j, phi1, theta1, phi2, theta2, violation, bp1, bp2, nv1))
+    
+    if convexity_violations:
+        print(f"\n  WARNING: {len(convexity_violations)} convexity violations detected!")
+        print("  This means the boundary is NOT convex (some boundary points cut off others).")
+        print("\n  Top 10 worst violations:")
+        convexity_violations.sort(key=lambda x: x[6], reverse=True)
+        for i, j, phi1, theta1, phi2, theta2, violation, bp1, bp2, nv1 in convexity_violations[:10]:
+            print(f"    Plane at ({phi1:.1f}, {theta1:.1f}) cuts off point at ({phi2:.1f}, {theta2:.1f})")
+            print(f"      violation = {violation:.6f}")
+            print(f"      bp1={bp1.round(4)}, bp2={bp2.round(4)}")
+            print(f"      normal={nv1.round(4)}")
+    else:
+        print(f"  All {len(boundary_data)} boundary points are mutually consistent: CONVEX")
+    
+    # Check 3: Normals should point "outward" - away from origin
+    # n · bp should be positive (normal points away from origin toward the boundary)
+    inward_normals = []
+    for bp, nv, phi, theta in boundary_data:
+        dot = np.dot(nv, bp)
+        if dot < 1e-6:
+            inward_normals.append((phi, theta, bp, nv, dot))
+    
+    if inward_normals:
+        print(f"\n  WARNING: {len(inward_normals)} normals may be pointing inward!")
+        for phi, theta, bp, nv, dot in inward_normals[:5]:
+            print(f"    phi={phi:.1f}, theta={theta:.1f}: n·bp = {dot:.6f}")
+            print(f"      boundary={bp.round(4)}, normal={nv.round(4)}")
 
 
 if __name__ == "__main__":

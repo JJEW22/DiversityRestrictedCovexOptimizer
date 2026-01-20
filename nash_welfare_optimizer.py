@@ -10,6 +10,113 @@ solvers.options['show_progress'] = False
 
 
 # =============================================================================
+# Shared Constants and Helper Functions for Dependent Agent Selection
+# =============================================================================
+
+# Threshold for considering an allocation as "meaningful" (not numerical noise)
+ALLOCATION_THRESHOLD = 1e-6
+
+# Tolerance for considering ratios as "tied"
+TIE_TOLERANCE = 1e-4
+
+
+def has_meaningful_allocation(allocation: float) -> bool:
+    """Check if an allocation value is meaningful (not just numerical noise)."""
+    return allocation > ALLOCATION_THRESHOLD
+
+
+def find_dependent_agents_for_resource(
+    resource_idx: int,
+    x_full: np.ndarray,
+    ratios: np.ndarray,
+    non_attacking_group: Set[int],
+    find_min: bool = True
+) -> Tuple[List[int], float]:
+    """
+    Find the dependent agent(s) for a resource.
+    
+    For forward direction (find_min=True): finds non-attackers with SMALLEST ratio who have allocation.
+    For backward direction (find_min=False): finds non-attackers with LARGEST ratio.
+    
+    Handles ties by returning all agents within TIE_TOLERANCE of the extreme ratio.
+    
+    Args:
+        resource_idx: Index of the resource (j)
+        x_full: Full allocation matrix (n_agents x n_resources)
+        ratios: Ratio matrix v_ij/V_i (n_agents x n_resources)
+        non_attacking_group: Set of non-attacker agent IDs
+        find_min: If True, find minimum ratio (forward). If False, find maximum (backward).
+    
+    Returns:
+        (list of tied agent IDs, extreme ratio value)
+        Returns ([], 0.0) if no valid agents found.
+    """
+    # Collect candidates
+    candidates = []
+    for agent in non_attacking_group:
+        # For forward direction, agent must have allocation
+        # For backward direction, any agent can receive resources
+        if find_min:
+            if not has_meaningful_allocation(x_full[agent, resource_idx]):
+                continue
+        candidates.append((agent, ratios[agent, resource_idx]))
+    
+    if not candidates:
+        return [], 0.0
+    
+    # Find extreme ratio
+    if find_min:
+        extreme_ratio = min(ratio for _, ratio in candidates)
+    else:
+        extreme_ratio = max(ratio for _, ratio in candidates)
+    
+    # Find all agents tied at the extreme ratio
+    tied_agents = [agent for agent, ratio in candidates if abs(ratio - extreme_ratio) < TIE_TOLERANCE]
+    
+    return tied_agents, extreme_ratio
+
+
+def compute_dependent_ratios_for_all_resources(
+    x_full: np.ndarray,
+    ratios: np.ndarray,
+    non_attacking_group: Set[int],
+    n_resources: int,
+    find_min: bool = True
+) -> Tuple[np.ndarray, List[List[int]]]:
+    """
+    Compute dependent ratios for all resources, handling ties by averaging.
+    
+    Args:
+        x_full: Full allocation matrix (n_agents x n_resources)
+        ratios: Ratio matrix v_ij/V_i (n_agents x n_resources)
+        non_attacking_group: Set of non-attacker agent IDs
+        n_resources: Number of resources
+        find_min: If True, find minimum ratio (forward). If False, find maximum (backward).
+    
+    Returns:
+        (dependent_ratios array, list of dependent agents for each resource)
+    """
+    dependent_ratios = np.zeros(n_resources)
+    dependent_agents_list = []
+    
+    for j in range(n_resources):
+        tied_agents, extreme_ratio = find_dependent_agents_for_resource(
+            j, x_full, ratios, non_attacking_group, find_min=find_min
+        )
+        
+        if tied_agents:
+            # Average the ratios of tied agents
+            avg_ratio = sum(ratios[agent, j] for agent in tied_agents) / len(tied_agents)
+            dependent_ratios[j] = avg_ratio
+        else:
+            dependent_ratios[j] = 0.0
+        
+        dependent_agents_list.append(tied_agents)
+    
+    return dependent_ratios, dependent_agents_list
+
+
+# =============================================================================
 # Standalone Normal Vector Computation
 # =============================================================================
 
@@ -25,21 +132,17 @@ def compute_normal_at_boundary(
     Compute the normal vector at a boundary point.
     
     The directional derivative is:
-        D(x) = |A| - Σ_a Σ_j (v_dj / V_d) * x_aj
+        D(x) = Σ_a Σ_j (v_aj/V_a - v_dj/V_d) * x_aj
     
-    Taking the gradient with respect to x_aj, we must account for the fact that
-    V_d may appear in multiple terms (for all resources k where d_k = d_j):
+    At the boundary, D(x) = 0. The gradient with respect to x_aj gives us the normal.
     
-        ∂D/∂x_aj = -[(v_dj / V_d) + Σ_{k: d_k = d_j} x_ak * (-v_dk / V_d²) * ∂V_d/∂x_aj]
+    For the simple case (ignoring second-order terms from V_d depending on x):
+        ∂D/∂x_aj ≈ (v_aj/V_a - v_dj/V_d)
     
-    where:
-        - d_j is the dependent agent for resource j
-        - ∂V_d/∂x_aj = -v_dj / agents_per_resource[j]
+    The normal pointing toward the feasible region (where D >= 0) is this gradient.
+    The normal pointing toward the excluded zone is the negative.
     
-    Substituting:
-        ∂D/∂x_aj = -[(v_dj / V_d) + (v_dj / (V_d² * agents_per_resource[j])) * Σ_{k: d_k = d_j} x_ak * v_dk]
-    
-    The normal pointing toward the excluded zone is the negative of this gradient.
+    When multiple agents are tied for dependent, we average their contributions.
     
     Args:
         x_full_boundary: Full allocation matrix at boundary point (n_agents x n_resources)
@@ -51,16 +154,10 @@ def compute_normal_at_boundary(
     
     Returns:
         Normal vector for the attacker's allocation space (n_resources dimensions), normalized.
+        Points toward the excluded zone (where attackers would want to go but can't).
     """
     # Compute V at boundary
     V_boundary = np.array([np.dot(utilities[i], x_full_boundary[i]) for i in range(n_agents)])
-    
-    # Count how many non-attackers share each resource (have allocation)
-    agents_per_resource = np.zeros(n_resources)
-    for j in range(n_resources):
-        for d in non_attacking_group:
-            if x_full_boundary[d, j] > 1e-10:
-                agents_per_resource[j] += 1
     
     # Compute v_ij/V_i for all agents at boundary
     ratios = np.zeros((n_agents, n_resources))
@@ -69,53 +166,30 @@ def compute_normal_at_boundary(
         for j in range(n_resources):
             ratios[i, j] = utilities[i, j] / V_i
     
-    # For each resource j, find the dependent agent (non-attacker with smallest v_dj/V_d who has allocation)
-    dependent_agent = [None] * n_resources
-    for j in range(n_resources):
-        min_ratio = float('inf')
-        min_agent = None
-        for d in non_attacking_group:
-            if x_full_boundary[d, j] > 1e-10:  # Must have allocation
-                if ratios[d, j] < min_ratio:
-                    min_ratio = ratios[d, j]
-                    min_agent = d
-        dependent_agent[j] = min_agent
+    # Use shared helper to find dependent ratios (forward direction = find_min=True)
+    dependent_ratios, _ = compute_dependent_ratios_for_all_resources(
+        x_full_boundary, ratios, non_attacking_group, n_resources, find_min=True
+    )
     
-    # Compute total attacker allocation for each resource
-    S_a = np.zeros(n_resources)
-    for k in range(n_resources):
+    # Compute attacker ratios (average over attackers if multiple)
+    attacker_ratios = np.zeros(n_resources)
+    for j in range(n_resources):
+        total = 0.0
+        count = 0
         for a in attacking_group:
-            S_a[k] += x_full_boundary[a, k]
+            V_a = max(V_boundary[a], 1e-10)
+            total += utilities[a, j] / V_a
+            count += 1
+        attacker_ratios[j] = total / count if count > 0 else 0.0
     
-    # Compute the gradient for each resource j
-    # ∂D/∂x_aj = -[(v_dj / V_d) - (v_dj / (V_d² * agents_per_resource[j])) * Σ_{k: d_k = d_j} x_ak * v_dk]
-    # Normal points toward excluded zone, so we negate: normal = -gradient
-    gradient = np.zeros(n_resources)
+    # The gradient of D with respect to attacker allocation x_aj is approximately:
+    # ∂D/∂x_aj ≈ (v_aj/V_a - v_dj/V_d)
+    # This points toward increasing D (toward feasible region)
+    # Normal toward excluded zone is the negative
+    gradient = attacker_ratios - dependent_ratios
     
-    for j in range(n_resources):
-        d_j = dependent_agent[j]
-        if d_j is None:
-            continue
-        
-        V_d = V_boundary[d_j]
-        v_dj = utilities[d_j, j]
-        
-        # Compute the sum: Σ_{k: d_k = d_j} S_a(k) * v_dk
-        sum_term = 0.0
-        for k in range(n_resources):
-            if dependent_agent[k] == d_j:
-                v_dk = utilities[d_j, k]
-                sum_term += S_a[k] * v_dk
-        
-        # ∂V_d/∂x_aj = -v_dj / agents_per_resource[j]
-        if agents_per_resource[j] > 0:
-            # gradient_j = -[(v_dj / V_d) + (v_dj / (V_d² * agents_per_resource[j])) * sum_term]
-            gradient[j] = -((v_dj / V_d) + (v_dj / (V_d**2 * agents_per_resource[j])) * sum_term)
-        else:
-            gradient[j] = -(v_dj / V_d)
-    
-    # Normal is negative of gradient (points toward excluded zone)
-    normal_attacker = -gradient
+    # Normal points toward excluded zone (where D < 0, i.e., where attackers want more)
+    normal_attacker = gradient  # Positive gradient means attacker wants more of this resource
     
     # Normalize
     norm = np.linalg.norm(normal_attacker)
@@ -867,6 +941,13 @@ class DirectionalDerivativeOracle:
                 role = "ATK" if i in self.attacking_group else "VIC"
                 print(f"      Agent {i} ({role}): {x_full[i].round(6)}, V={V[i]:.6f}")
         
+        # Compute ratios for all agents
+        ratios = np.zeros((self.n_agents, self.n_resources))
+        for i in range(self.n_agents):
+            V_i = max(V[i], 1e-10)
+            for j in range(self.n_resources):
+                ratios[i, j] = self.utilities[i, j] / V_i
+        
         # Attackers: direction is their allocation (positive for forward, negative for backward)
         sign = -1.0 if backward else 1.0
         for i in self.attacking_group:
@@ -884,61 +965,39 @@ class DirectionalDerivativeOracle:
                     print(f"      -> No attacker allocation, skipping")
                 continue
             
-            if backward:
-                # Backward: non-attackers GAIN, so find one with LARGEST ratio
-                # (they benefit most from gaining this resource)
-                best_agent = None
-                best_ratio = -float('inf')
+            # Use shared helper to find tied agents
+            # backward=True means find max ratio, backward=False means find min ratio
+            tied_agents, extreme_ratio = find_dependent_agents_for_resource(
+                j, x_full, ratios, self.non_attacking_group, find_min=(not backward)
+            )
+            
+            if self.verbose:
+                ratio_type = "LARGEST" if backward else "SMALLEST with allocation"
+                print(f"      Non-attacker ratios for resource {j} (looking for {ratio_type}):")
+                for i in self.non_attacking_group:
+                    has_alloc = has_meaningful_allocation(x_full[i, j])
+                    alloc_str = f"x={x_full[i,j]:.6f}" if has_alloc else f"x={x_full[i,j]:.6f} (skipped)"
+                    print(f"        Agent {i}: {alloc_str}, v={self.utilities[i,j]:.4f}, V={max(V[i],1e-10):.6f}, ratio={ratios[i,j]:.6f}")
+            
+            if tied_agents:
+                # Divide the direction equally among tied agents
+                if backward:
+                    direction_per_agent = attacker_total / len(tied_agents)  # Positive (gaining)
+                else:
+                    direction_per_agent = -attacker_total / len(tied_agents)  # Negative (losing)
+                
+                for agent in tied_agents:
+                    direction[agent, j] = direction_per_agent
                 
                 if self.verbose:
-                    print(f"      Non-attacker ratios (v_ij/V_i) for resource {j} (looking for LARGEST):")
-                
-                for i in self.non_attacking_group:
-                    V_i = max(V[i], 1e-10)
-                    ratio = self.utilities[i, j] / V_i
-                    if self.verbose:
-                        print(f"        Agent {i}: v={self.utilities[i,j]:.4f}, V={V_i:.6f}, ratio={ratio:.6f}")
-                    if ratio > best_ratio:
-                        best_ratio = ratio
-                        best_agent = i
-                
-                if best_agent is not None:
-                    # Backward: attacker loses, non-attacker gains
-                    direction[best_agent, j] = attacker_total  # Positive (gaining)
-                    if self.verbose:
-                        print(f"      -> Assigned direction[{best_agent},{j}] = {attacker_total:.6f}")
-                else:
-                    valid = False
-                    if self.verbose:
-                        print(f"      -> WARNING: No non-attacker found for resource {j}")
+                    print(f"      -> {len(tied_agents)} agents tied at ratio {extreme_ratio:.6f}: {tied_agents}")
+                    print(f"      -> Assigned direction {direction_per_agent:.6f} to each")
             else:
-                # Forward: non-attackers LOSE, so find one with SMALLEST ratio who has allocation
-                best_agent = None
-                best_ratio = float('inf')
-                
+                valid = False
                 if self.verbose:
-                    print(f"      Non-attacker ratios (v_ij/V_i) for resource {j} (looking for SMALLEST with allocation):")
-                
-                for i in self.non_attacking_group:
-                    if x_full[i, j] > 1e-10:  # Must have some allocation of this resource
-                        V_i = max(V[i], 1e-10)
-                        ratio = self.utilities[i, j] / V_i
-                        if self.verbose:
-                            print(f"        Agent {i}: x={x_full[i,j]:.6f}, v={self.utilities[i,j]:.4f}, V={V_i:.6f}, ratio={ratio:.6f}")
-                        if ratio < best_ratio:
-                            best_ratio = ratio
-                            best_agent = i
-                    elif self.verbose:
-                        print(f"        Agent {i}: x={x_full[i,j]:.6f} (no allocation, skipped)")
-                
-                if best_agent is not None:
-                    direction[best_agent, j] = -attacker_total  # Negative (losing)
-                    if self.verbose:
-                        print(f"      -> Assigned direction[{best_agent},{j}] = {-attacker_total:.6f}")
-                else:
-                    # No non-attacker has this resource - forward direction is invalid
-                    valid = False
-                    if self.verbose:
+                    if backward:
+                        print(f"      -> WARNING: No non-attacker found for resource {j}")
+                    else:
                         print(f"      -> No non-attacker has resource {j}, forward direction INVALID")
         
         if self.verbose:
@@ -1481,14 +1540,33 @@ class SwapOptimalityOracle:
         x_full = self._get_full_allocation(x_free)
         V = self._compute_utilities_from_allocation(x_full)
         
+        # Compute total allocation per resource for non-attackers
+        # Skip resources where non-attackers have essentially nothing (attacker took all)
+        non_attacker_total_per_resource = np.zeros(self.n_resources)
+        for i in self.non_attacking_group:
+            non_attacker_total_per_resource += x_full[i, :]
+        
         # Find the best swap among non-attackers
         non_attackers = list(self.non_attacking_group)
         best_swap = None
         best_improvement = 0.0
         
+        def round_to_sig_figs(x, sig_figs=3):
+            """Round to significant figures."""
+            if x == 0:
+                return 0
+            return round(x, sig_figs - 1 - int(np.floor(np.log10(abs(x)))))
+        
         for r in range(self.n_resources):
+            # Skip resources where non-attackers have essentially no allocation
+            # (attacker took all or nearly all of it)
+            if non_attacker_total_per_resource[r] < 1e-6:
+                continue
+            
             for i in non_attackers:
-                if x_full[i, r] < 1e-10:
+                # Skip if agent i has essentially no allocation of this resource
+                # (nothing meaningful to transfer)
+                if x_full[i, r] < 1e-6:
                     continue
                 
                 V_i = max(V[i], 1e-10)
@@ -1501,10 +1579,17 @@ class SwapOptimalityOracle:
                     V_j = max(V[j], 1e-10)
                     ratio_j = self.utilities[j, r] / V_j
                     
+                    # Compare ratios rounded to 3 significant figures
+                    # Only consider it a violation if ratio_j is meaningfully larger
+                    ratio_i_rounded = round_to_sig_figs(ratio_i, 3)
+                    ratio_j_rounded = round_to_sig_figs(ratio_j, 3)
+                    
                     improvement = ratio_j - ratio_i
-                    if improvement > best_improvement + 1e-10:
-                        best_improvement = improvement
-                        best_swap = (i, j, r)
+                    # Require improvement >= 0.001 and rounded ratios to differ
+                    if ratio_j_rounded > ratio_i_rounded and improvement >= 0.001:
+                        if improvement > best_improvement:
+                            best_improvement = improvement
+                            best_swap = (i, j, r)
         
         if best_swap is None:
             if self.verbose:
@@ -1513,12 +1598,12 @@ class SwapOptimalityOracle:
         
         agent_from, agent_to, resource = best_swap
         
-        if self.verbose:
-            V_from, V_to = max(V[agent_from], 1e-10), max(V[agent_to], 1e-10)
-            print(f"    -> VIOLATED: Agent {agent_from} -> Agent {agent_to} for resource {resource}")
-            print(f"      Agent {agent_from}: x={x_full[agent_from, resource]:.6f}, v/V={self.utilities[agent_from, resource]/V_from:.6f}")
-            print(f"      Agent {agent_to}: x={x_full[agent_to, resource]:.6f}, v/V={self.utilities[agent_to, resource]/V_to:.6f}")
-            print(f"      Improvement: {best_improvement:.6f}")
+        # Always print swap violation details for debugging
+        V_from, V_to = max(V[agent_from], 1e-10), max(V[agent_to], 1e-10)
+        print(f"    -> SWAP VIOLATED: Agent {agent_from} -> Agent {agent_to} for resource {resource}")
+        print(f"      Agent {agent_from}: x={x_full[agent_from, resource]:.10f}, V={V_from:.10f}, v_r={self.utilities[agent_from, resource]:.10f}, v/V={self.utilities[agent_from, resource]/V_from:.10f}")
+        print(f"      Agent {agent_to}: x={x_full[agent_to, resource]:.10f}, V={V_to:.10f}, v_r={self.utilities[agent_to, resource]:.10f}, v/V={self.utilities[agent_to, resource]/V_to:.10f}")
+        print(f"      Improvement: {best_improvement:.10f}")
         
         normal, rhs = self._find_separating_hyperplane(x_full, V, agent_from, agent_to, resource)
         
@@ -1631,6 +1716,71 @@ class OptimalBoundaryOracle:
         return self.dir_deriv_oracle.is_violated(x_free)
 
 
+def _project_to_feasible_region(
+    x_target: np.ndarray,
+    G: np.ndarray,
+    h: np.ndarray,
+    A_eq: np.ndarray,
+    b_eq: np.ndarray,
+    n_agents: int,
+    n_resources: int,
+    supply: np.ndarray
+) -> Tuple[np.ndarray, str]:
+    """
+    Project x_target onto the feasible region defined by cutting planes.
+    
+    Solves: min ||x - x_target||² 
+            subject to: G @ x <= h, A_eq @ x = b_eq
+    
+    This is a QP, much faster than the full log-sum CP.
+    
+    Args:
+        x_target: Point to project (the unconstrained optimum)
+        G: Inequality constraint matrix
+        h: Inequality constraint RHS
+        A_eq: Equality constraint matrix
+        b_eq: Equality constraint RHS
+        n_agents: Number of agents
+        n_resources: Number of resources
+        supply: Resource supply vector
+    
+    Returns:
+        (projected_point, status)
+    """
+    n_free_vars = len(x_target)
+    
+    # QP: min (1/2) x^T P x + q^T x
+    # For ||x - x_target||², we have:
+    # P = 2 * I
+    # q = -2 * x_target
+    
+    P = matrix(2.0 * np.eye(n_free_vars))
+    q = matrix(-2.0 * x_target)
+    
+    G_cvx = matrix(G)
+    h_cvx = matrix(h)
+    A_cvx = matrix(A_eq)
+    b_cvx = matrix(b_eq)
+    
+    old_show_progress = solvers.options.get('show_progress', False)
+    solvers.options['show_progress'] = False
+    
+    try:
+        sol = solvers.qp(P, q, G_cvx, h_cvx, A_cvx, b_cvx)
+    except Exception as e:
+        solvers.options['show_progress'] = old_show_progress
+        return x_target, f"projection_error: {e}"
+    finally:
+        solvers.options['show_progress'] = old_show_progress
+    
+    if sol['status'] in ['optimal', 'unknown']:
+        x_proj = np.array(sol['x']).flatten()
+        x_proj = np.maximum(x_proj, 0)  # Ensure non-negative
+        return x_proj, 'optimal'
+    else:
+        return x_target, sol['status']
+
+
 def _solve_optimal_constraint_convex_program(
     utilities: np.ndarray,
     attacking_group: Set[int],
@@ -1639,7 +1789,9 @@ def _solve_optimal_constraint_convex_program(
     initial_constraints: Optional[Dict[int, AgentDiversityConstraint]] = None,
     maximize_harm: bool = False,
     verbose: bool = False,
-    debug: bool = False
+    debug: bool = False,
+    use_projection: bool = True,
+    use_two_phase: bool = True
 ) -> Tuple[Optional[Dict[int, np.ndarray]], np.ndarray, str]:
     """
     Solve the convex program to find optimal proportionality constraints.
@@ -1652,6 +1804,9 @@ def _solve_optimal_constraint_convex_program(
     1. SwapOptimalityOracle - ensures non-attackers are swap-optimal among themselves
     2. DirectionalDerivativeOracle - ensures we're on the optimal boundary
     
+    Optimization: Uses projection of unconstrained optimum as a fast filter before
+    solving the full inner CP. Only solves the expensive CP when projection is feasible.
+    
     Args:
         utilities: Preference matrix (n_agents, n_resources)
         attacking_group: Set of attacker agent indices
@@ -1661,6 +1816,7 @@ def _solve_optimal_constraint_convex_program(
         maximize_harm: If True, minimize target utility; if False, maximize target utility
         verbose: Print progress
         debug: Print detailed debug information
+        use_projection: If True, use projection-based optimization; if False, always use inner solve
     
     Returns:
         Tuple of:
@@ -1737,10 +1893,51 @@ def _solve_optimal_constraint_convex_program(
         x[start:start + n_resources] = supply / n_agents
     
     # Iterative optimization with cutting planes
-    max_iterations = 100
+    max_iterations = 150
+    max_projections_per_inner_solve = 7  # Max projections between inner CP solves
     n_swap_cuts = 0
     n_dir_deriv_cuts = 0
+    n_projection_iterations = 0
+    n_inner_solves = 0
+    n_cuts_from_projection = 0  # Cuts added after projection
+    n_cuts_from_inner_solve = 0  # Cuts added after inner solve
     final_iteration = 0
+    
+    # First, solve the unconstrained problem to get x* (global optimum)
+    if verbose:
+        print(f"  [ConvexProgram] Solving unconstrained problem to get global optimum...")
+    
+    x_star, status = _solve_inner_optimization(
+        utilities, n_agents, n_resources, attacking_group, target_group,
+        G_base, h_base, A_eq, b_eq, supply, maximize_harm, verbose,
+        use_two_phase=use_two_phase
+    )
+    n_inner_solves += 1
+    
+    if status != 'optimal':
+        if verbose:
+            print(f"  [ConvexProgram] Unconstrained optimization failed: {status}")
+        x_full = x_star.reshape((n_agents, n_resources))
+        return None, x_full, status, {
+            'iterations': 1,
+            'swap_cuts': 0,
+            'dir_deriv_cuts': 0,
+            'total_cuts': 0,
+            'backward_checks': dir_deriv_oracle.n_backward_checks,
+            'backward_violations': dir_deriv_oracle.n_backward_violations,
+            'converged': False,
+            'failure_reason': status,
+            'cut_details': cut_details,
+            'projection_iterations': 0,
+            'inner_solves': n_inner_solves
+        }
+    
+    if verbose:
+        print(f"  [ConvexProgram] Got global optimum x*")
+    
+    # Check if x* is already feasible (satisfies both oracles)
+    x = x_star.copy()
+    projections_since_last_inner_solve = 0
     
     for iteration in range(max_iterations):
         final_iteration = iteration
@@ -1753,33 +1950,61 @@ def _solve_optimal_constraint_convex_program(
             G = G_base
             h = h_base
         
-        # Solve inner optimization: maximize/minimize target group utility
-        x, status = _solve_inner_optimization(
-            utilities, n_agents, n_resources, attacking_group, target_group,
-            G, h, A_eq, b_eq, supply, maximize_harm, verbose
-        )
+        # Decide whether to use projection or full inner solve
+        # Use projection if enabled, we have cuts, and haven't exhausted projection budget since last inner solve
+        do_projection = use_projection and (projections_since_last_inner_solve < max_projections_per_inner_solve) and (len(cuts_G) > 0)
         
-        if verbose:
-            print(f"  [ConvexProgram] Iteration {iteration}: inner status={status}")
+        if do_projection:
+            # Project x* onto current feasible region
+            x_proj, proj_status = _project_to_feasible_region(
+                x_star, G, h, A_eq, b_eq, n_agents, n_resources, supply
+            )
+            n_projection_iterations += 1
+            projections_since_last_inner_solve += 1
+            
+            if proj_status != 'optimal':
+                if verbose:
+                    print(f"  [ConvexProgram] Iteration {iteration}: projection failed ({proj_status}), falling back to inner solve")
+                do_projection = False
+            else:
+                x = x_proj
+                if verbose:
+                    print(f"  [ConvexProgram] Iteration {iteration}: using projection ({projections_since_last_inner_solve}/{max_projections_per_inner_solve})")
         
-        if status != 'optimal':
+        if not do_projection:
+            # Solve full inner optimization
+            x, status = _solve_inner_optimization(
+                utilities, n_agents, n_resources, attacking_group, target_group,
+                G, h, A_eq, b_eq, supply, maximize_harm, verbose,
+                use_two_phase=use_two_phase
+            )
+            n_inner_solves += 1
+            projections_since_last_inner_solve = 0  # Reset projection counter
+            
             if verbose:
-                print(f"  [ConvexProgram] Inner optimization failed: {status}")
-            x_full = x.reshape((n_agents, n_resources))
-            return None, x_full, status, {
-                'iterations': iteration + 1,
-                'swap_cuts': n_swap_cuts,
-                'dir_deriv_cuts': n_dir_deriv_cuts,
-                'total_cuts': n_swap_cuts + n_dir_deriv_cuts,
-                'backward_checks': dir_deriv_oracle.n_backward_checks,
-                'backward_violations': dir_deriv_oracle.n_backward_violations,
-                'converged': False,
-                'failure_reason': status,
-                'cut_details': cut_details
-            }
+                print(f"  [ConvexProgram] Iteration {iteration}: inner solve status={status}")
+            
+            if status != 'optimal':
+                if verbose:
+                    print(f"  [ConvexProgram] Inner optimization failed: {status}")
+                x_full = x.reshape((n_agents, n_resources))
+                return None, x_full, status, {
+                    'iterations': iteration + 1,
+                    'swap_cuts': n_swap_cuts,
+                    'dir_deriv_cuts': n_dir_deriv_cuts,
+                    'total_cuts': n_swap_cuts + n_dir_deriv_cuts,
+                    'backward_checks': dir_deriv_oracle.n_backward_checks,
+                    'backward_violations': dir_deriv_oracle.n_backward_violations,
+                    'converged': False,
+                    'failure_reason': status,
+                    'cut_details': cut_details,
+                    'projection_iterations': n_projection_iterations,
+                    'inner_solves': n_inner_solves
+                }
         
         # Check both oracles independently
         cuts_added_this_iteration = 0
+        cut_source = 'projection' if do_projection else 'inner_solve'
         
         # Check swap-optimality oracle
         swap_violated, swap_normal, swap_rhs = swap_oracle.is_violated(x)
@@ -1788,12 +2013,17 @@ def _solve_optimal_constraint_convex_program(
             cuts_h.append(np.array([swap_rhs]))
             n_swap_cuts += 1
             cuts_added_this_iteration += 1
+            if do_projection:
+                n_cuts_from_projection += 1
+            else:
+                n_cuts_from_inner_solve += 1
             
             # Store cut details
             cut_details.append({
                 'cut_number': len(cut_details) + 1,
                 'cut_type': 'swap',
                 'iteration': iteration,
+                'source': cut_source,
                 'violating_point': x.copy(),  # Point that was outside the boundary
                 'boundary_point': swap_oracle.last_boundary_point.copy() if swap_oracle.last_boundary_point is not None else x.copy(),
                 'normal': swap_normal.copy(),
@@ -1801,7 +2031,7 @@ def _solve_optimal_constraint_convex_program(
             })
             
             if verbose:
-                print(f"  [ConvexProgram] Iteration {iteration}: swap oracle violated, added cut {n_swap_cuts}")
+                print(f"  [ConvexProgram] Iteration {iteration}: swap oracle violated, added cut {n_swap_cuts} (from {cut_source})")
         
         # Check directional derivative oracle
         dir_violated, dir_normal, dir_rhs = dir_deriv_oracle.is_violated(x)
@@ -1810,12 +2040,17 @@ def _solve_optimal_constraint_convex_program(
             cuts_h.append(np.array([dir_rhs]))
             n_dir_deriv_cuts += 1
             cuts_added_this_iteration += 1
+            if do_projection:
+                n_cuts_from_projection += 1
+            else:
+                n_cuts_from_inner_solve += 1
             
             # Store cut details
             cut_details.append({
                 'cut_number': len(cut_details) + 1,
                 'cut_type': 'dir_deriv',
                 'iteration': iteration,
+                'source': cut_source,
                 'violating_point': x.copy(),  # Point that was outside the boundary
                 'boundary_point': dir_deriv_oracle.last_boundary_point.copy() if dir_deriv_oracle.last_boundary_point is not None else x.copy(),
                 'normal': dir_normal.copy(),
@@ -1823,16 +2058,87 @@ def _solve_optimal_constraint_convex_program(
             })
             
             if verbose:
-                print(f"  [ConvexProgram] Iteration {iteration}: dir_deriv oracle violated, added cut {n_dir_deriv_cuts}")
+                print(f"  [ConvexProgram] Iteration {iteration}: dir_deriv oracle violated, added cut {n_dir_deriv_cuts} (from {cut_source})")
         
         if verbose:
             print(f"  [ConvexProgram] Iteration {iteration}: swap_violated={swap_violated}, dir_violated={dir_violated}")
         
-        # Converge only when BOTH oracles are satisfied
-        if not swap_violated and not dir_violated:
+        # If projection was used and oracles are satisfied, do one inner solve to get exact optimum
+        if do_projection and not swap_violated and not dir_violated:
+            if verbose:
+                print(f"  [ConvexProgram] Projection feasible, solving inner CP for exact optimum...")
+            x, status = _solve_inner_optimization(
+                utilities, n_agents, n_resources, attacking_group, target_group,
+                G, h, A_eq, b_eq, supply, maximize_harm, verbose,
+                use_two_phase=use_two_phase
+            )
+            n_inner_solves += 1
+            projections_since_last_inner_solve = 0  # Reset projection counter
+            
+            if status != 'optimal':
+                if verbose:
+                    print(f"  [ConvexProgram] Final inner optimization failed: {status}")
+                # Use the projected point as fallback
+                x = x_proj
+            else:
+                # Re-check oracles on the inner solve result
+                swap_violated, swap_normal, swap_rhs = swap_oracle.is_violated(x)
+                dir_violated, dir_normal, dir_rhs = dir_deriv_oracle.is_violated(x)
+                
+                if swap_violated:
+                    cuts_G.append(swap_normal.reshape(1, -1))
+                    cuts_h.append(np.array([swap_rhs]))
+                    n_swap_cuts += 1
+                    n_cuts_from_inner_solve += 1
+                    cut_details.append({
+                        'cut_number': len(cut_details) + 1,
+                        'cut_type': 'swap',
+                        'iteration': iteration,
+                        'source': 'inner_solve_after_projection',
+                        'violating_point': x.copy(),
+                        'boundary_point': swap_oracle.last_boundary_point.copy() if swap_oracle.last_boundary_point is not None else x.copy(),
+                        'normal': swap_normal.copy(),
+                        'rhs': swap_rhs
+                    })
+                    if verbose:
+                        print(f"  [ConvexProgram] Inner solve violated swap oracle, added cut {n_swap_cuts}")
+                
+                if dir_violated:
+                    cuts_G.append(dir_normal.reshape(1, -1))
+                    cuts_h.append(np.array([dir_rhs]))
+                    n_dir_deriv_cuts += 1
+                    n_cuts_from_inner_solve += 1
+                    cut_details.append({
+                        'cut_number': len(cut_details) + 1,
+                        'cut_type': 'dir_deriv',
+                        'iteration': iteration,
+                        'source': 'inner_solve_after_projection',
+                        'violating_point': x.copy(),
+                        'boundary_point': dir_deriv_oracle.last_boundary_point.copy() if dir_deriv_oracle.last_boundary_point is not None else x.copy(),
+                        'normal': dir_normal.copy(),
+                        'rhs': dir_rhs
+                    })
+                    if verbose:
+                        print(f"  [ConvexProgram] Inner solve violated dir_deriv oracle, added cut {n_dir_deriv_cuts}")
+                
+                if swap_violated or dir_violated:
+                    if verbose:
+                        print(f"  [ConvexProgram] Inner solve result violated oracles, continuing...")
+                    continue
+        
+        # Converge only when BOTH oracles are satisfied (and we used inner solve, not just projection)
+        if not swap_violated and not dir_violated and not do_projection:
             if verbose:
                 print(f"  [ConvexProgram] Converged after {iteration + 1} iterations")
+                print(f"  [ConvexProgram] Stats: {n_projection_iterations} projection iters, {n_inner_solves} inner solves")
+            converged = True
             break
+    else:
+        # Loop completed without breaking - did not converge
+        converged = False
+        if verbose:
+            print(f"  [ConvexProgram] Did not converge after {max_iterations} iterations")
+            print(f"  [ConvexProgram] Stats: {n_projection_iterations} projection iters, {n_inner_solves} inner solves")
     
     # Extract directions for attacking group
     x_full = x.reshape((n_agents, n_resources))
@@ -1862,17 +2168,21 @@ def _solve_optimal_constraint_convex_program(
         'swap_cuts': n_swap_cuts,
         'dir_deriv_cuts': n_dir_deriv_cuts,
         'total_cuts': n_swap_cuts + n_dir_deriv_cuts,
+        'cuts_from_projection': n_cuts_from_projection,
+        'cuts_from_inner_solve': n_cuts_from_inner_solve,
         'backward_checks': dir_deriv_oracle.n_backward_checks,
         'backward_violations': dir_deriv_oracle.n_backward_violations,
-        'converged': True,
-        'failure_reason': None,
-        'cut_details': cut_details
+        'converged': converged,
+        'failure_reason': None if converged else 'max_iterations_reached',
+        'cut_details': cut_details,
+        'projection_iterations': n_projection_iterations,
+        'inner_solves': n_inner_solves
     }
     
     return optimal_directions, x_full, 'optimal', cp_debug_info
 
 
-def _solve_inner_optimization(
+def _solve_inner_optimization_cvxopt(
     utilities: np.ndarray,
     n_agents: int,
     n_resources: int,
@@ -1887,7 +2197,7 @@ def _solve_inner_optimization(
     verbose: bool
 ) -> Tuple[np.ndarray, str]:
     """
-    Solve the inner optimization problem for the given constraints.
+    Solve the inner optimization problem using CVXOPT.
     
     The objective is: sum_{i in target} log(V_i)
     
@@ -1904,14 +2214,14 @@ def _solve_inner_optimization(
     n_free_vars = n_agents * n_resources
     
     if verbose:
-        print(f"  [InnerOpt] target_group={target_group}, maximize_harm={maximize_harm}")
-        print(f"  [InnerOpt] n_free_vars={n_free_vars}")
+        print(f"  [InnerOpt-CVXOPT] target_group={target_group}, maximize_harm={maximize_harm}")
+        print(f"  [InnerOpt-CVXOPT] n_free_vars={n_free_vars}")
     
     def get_full_allocation(x_np):
         """Convert free variables to full allocation matrix."""
         return x_np.reshape((n_agents, n_resources))
     
-    def compute_utilities(x_np):
+    def compute_utilities_inner(x_np):
         """Compute utilities for all agents."""
         x_full = get_full_allocation(x_np)
         return np.array([np.dot(utilities[i], x_full[i]) for i in range(n_agents)])
@@ -1958,7 +2268,7 @@ def _solve_inner_optimization(
                 return (0, matrix(x0))
             
             x_np = np.array(x).flatten()
-            V = compute_utilities(x_np)
+            V = compute_utilities_inner(x_np)
             
             # Check for non-positive utilities for target group
             for i in target_group:
@@ -2011,13 +2321,13 @@ def _solve_inner_optimization(
         except Exception as e:
             solvers.options['show_progress'] = old_show_progress
             if verbose:
-                print(f"  [InnerOpt] Exception: {e}")
+                print(f"  [InnerOpt-CVXOPT] Exception: {e}")
             return x0, f"solver_error: {e}"
         finally:
             solvers.options['show_progress'] = old_show_progress
         
         if verbose:
-            print(f"  [InnerOpt] Solver status: {sol['status']}")
+            print(f"  [InnerOpt-CVXOPT] Solver status: {sol['status']}")
         
         if sol['status'] in ['optimal', 'unknown']:
             x = np.array(sol['x']).flatten()
@@ -2032,12 +2342,12 @@ def _solve_inner_optimization(
         
         def compute_objective(x_np):
             """Compute objective."""
-            V = compute_utilities(x_np)
+            V = compute_utilities_inner(x_np)
             return sum(np.log(max(V[i], 1e-10)) for i in target_group)
         
         def compute_gradient(x_np):
             """Compute gradient of objective."""
-            V = compute_utilities(x_np)
+            V = compute_utilities_inner(x_np)
             grad = np.zeros(n_free_vars)
             
             for i in target_group:
@@ -2071,7 +2381,7 @@ def _solve_inner_optimization(
             dir_norm = np.linalg.norm(direction)
             if dir_norm < 1e-10:
                 if verbose:
-                    print(f"  [InnerOpt] Converged at iteration {iteration} (zero gradient)")
+                    print(f"  [InnerOpt-CVXOPT] Converged at iteration {iteration} (zero gradient)")
                 break
             direction = direction / dir_norm
             
@@ -2084,7 +2394,7 @@ def _solve_inner_optimization(
                 x_new = project_to_feasible(x_new)
                 
                 # Check if target utilities are positive
-                V_new = compute_utilities(x_new)
+                V_new = compute_utilities_inner(x_new)
                 if all(V_new[i] > 1e-10 for i in target_group):
                     new_obj = compute_objective(x_new)
                     if new_obj < current_obj:
@@ -2106,14 +2416,593 @@ def _solve_inner_optimization(
             # Check convergence
             if step < min_step:
                 if verbose:
-                    print(f"  [InnerOpt] Converged at iteration {iteration} (small step)")
+                    print(f"  [InnerOpt-CVXOPT] Converged at iteration {iteration} (small step)")
                 break
         
         if verbose:
-            print(f"  [InnerOpt] PGD finished after {iteration + 1} iterations")
-            print(f"  [InnerOpt] Final objective: {best_obj:.6f}")
+            print(f"  [InnerOpt-CVXOPT] PGD finished after {iteration + 1} iterations")
+            print(f"  [InnerOpt-CVXOPT] Final objective: {best_obj:.6f}")
         
         return best_x, 'optimal'
+
+
+# Global flag to track if Gurobi is available
+_GUROBI_AVAILABLE = None
+
+def _check_gurobi_available():
+    """Check if Gurobi is available."""
+    global _GUROBI_AVAILABLE
+    if _GUROBI_AVAILABLE is None:
+        try:
+            import gurobipy as gp
+            # Try to create a model to verify license
+            env = gp.Env(empty=True)
+            env.setParam('OutputFlag', 0)
+            env.start()
+            model = gp.Model(env=env)
+            model.dispose()
+            env.dispose()
+            _GUROBI_AVAILABLE = True
+        except Exception:
+            _GUROBI_AVAILABLE = False
+    return _GUROBI_AVAILABLE
+
+
+def _solve_inner_optimization_gurobi(
+    utilities: np.ndarray,
+    n_agents: int,
+    n_resources: int,
+    attacking_group: Set[int],
+    target_group: Set[int],
+    G: np.ndarray,
+    h: np.ndarray,
+    A_eq: np.ndarray,
+    b_eq: np.ndarray,
+    supply: np.ndarray,
+    maximize_harm: bool,
+    verbose: bool
+) -> Tuple[np.ndarray, str]:
+    """
+    Solve the inner optimization problem using Gurobi.
+    
+    The objective is: sum_{i in target} log(V_i)
+    
+    This maximizes/minimizes the Nash welfare of the target group.
+    
+    Gurobi supports log() natively in nonlinear objectives.
+    
+    Returns:
+        (x_optimal, status): Optimal allocation (flattened) and status
+    """
+    import gurobipy as gp
+    from gurobipy import GRB
+    
+    n_free_vars = n_agents * n_resources
+    
+    if verbose:
+        print(f"  [InnerOpt-Gurobi] target_group={target_group}, maximize_harm={maximize_harm}")
+        print(f"  [InnerOpt-Gurobi] n_free_vars={n_free_vars}")
+    
+    # Initial point for fallback
+    x0 = np.zeros(n_free_vars)
+    for i in range(n_agents):
+        start = i * n_resources
+        x0[start:start + n_resources] = supply / n_agents
+    
+    try:
+        # Create environment with output suppressed
+        env = gp.Env(empty=True)
+        env.setParam('OutputFlag', 0)
+        env.start()
+        
+        model = gp.Model(env=env)
+        model.Params.OutputFlag = 0
+        model.Params.NonConvex = 2  # Allow non-convex quadratic objectives
+        
+        # Create variables: x[i, j] = allocation of resource j to agent i
+        x = {}
+        for i in range(n_agents):
+            for j in range(n_resources):
+                x[i, j] = model.addVar(lb=0, ub=supply[j], name=f"x_{i}_{j}")
+        
+        # Equality constraints: sum_i x[i,j] = supply[j]
+        for j in range(n_resources):
+            model.addConstr(
+                gp.quicksum(x[i, j] for i in range(n_agents)) == supply[j],
+                name=f"supply_{j}"
+            )
+        
+        # Add cutting plane constraints from G @ x <= h
+        n_cuts = G.shape[0] - 2 * n_free_vars  # Exclude base non-negativity and upper bound constraints
+        for cut_idx in range(G.shape[0]):
+            # Convert row to constraint
+            lhs = gp.quicksum(
+                G[cut_idx, i * n_resources + j] * x[i, j]
+                for i in range(n_agents)
+                for j in range(n_resources)
+            )
+            model.addConstr(lhs <= h[cut_idx], name=f"cut_{cut_idx}")
+        
+        # Create utility variables V[i] = sum_j utilities[i,j] * x[i,j]
+        V = {}
+        for i in range(n_agents):
+            V[i] = model.addVar(lb=1e-8, name=f"V_{i}")  # Small positive lower bound
+            model.addConstr(
+                V[i] == gp.quicksum(utilities[i, j] * x[i, j] for j in range(n_resources)),
+                name=f"utility_{i}"
+            )
+        
+        # Objective: sum_{i in target} log(V[i])
+        # Gurobi doesn't support log() directly in the objective, so we use a piecewise linear approximation
+        # or auxiliary variables with general constraints
+        
+        # Use auxiliary variables for log
+        log_V = {}
+        for i in target_group:
+            log_V[i] = model.addVar(lb=-GRB.INFINITY, name=f"log_V_{i}")
+            # Add general constraint: log_V[i] = log(V[i])
+            model.addGenConstrLog(V[i], log_V[i], name=f"log_constr_{i}")
+        
+        # Set objective
+        if maximize_harm:
+            # Minimize sum of log utilities
+            model.setObjective(
+                gp.quicksum(log_V[i] for i in target_group),
+                GRB.MINIMIZE
+            )
+        else:
+            # Maximize sum of log utilities
+            model.setObjective(
+                gp.quicksum(log_V[i] for i in target_group),
+                GRB.MAXIMIZE
+            )
+        
+        # Solve
+        model.optimize()
+        
+        if verbose:
+            print(f"  [InnerOpt-Gurobi] Solver status: {model.Status}")
+        
+        if model.Status == GRB.OPTIMAL or model.Status == GRB.SUBOPTIMAL:
+            # Extract solution
+            x_sol = np.zeros(n_free_vars)
+            for i in range(n_agents):
+                for j in range(n_resources):
+                    x_sol[i * n_resources + j] = x[i, j].X
+            
+            x_sol = np.maximum(x_sol, 0)
+            
+            model.dispose()
+            env.dispose()
+            
+            return x_sol, 'optimal'
+        else:
+            model.dispose()
+            env.dispose()
+            
+            status_map = {
+                GRB.INFEASIBLE: 'infeasible',
+                GRB.INF_OR_UNBD: 'infeasible_or_unbounded',
+                GRB.UNBOUNDED: 'unbounded',
+                GRB.NUMERIC: 'numeric_error',
+                GRB.TIME_LIMIT: 'time_limit',
+            }
+            status_str = status_map.get(model.Status, f'gurobi_status_{model.Status}')
+            return x0, status_str
+            
+    except Exception as e:
+        if verbose:
+            print(f"  [InnerOpt-Gurobi] Exception: {e}")
+        return x0, f"solver_error: {e}"
+
+
+# Default solver selection
+_DEFAULT_SOLVER = 'gurobi'  # Will fall back to cvxopt if gurobi not available
+
+def set_default_solver(solver: str):
+    """Set the default solver for inner optimization.
+    
+    Args:
+        solver: 'gurobi' or 'cvxopt'
+    """
+    global _DEFAULT_SOLVER
+    if solver not in ['gurobi', 'cvxopt']:
+        raise ValueError(f"Unknown solver: {solver}. Must be 'gurobi' or 'cvxopt'.")
+    _DEFAULT_SOLVER = solver
+
+
+def get_default_solver() -> str:
+    """Get the current default solver."""
+    return _DEFAULT_SOLVER
+
+
+def _solve_inner_optimization_two_phase(
+    utilities: np.ndarray,
+    n_agents: int,
+    n_resources: int,
+    attacking_group: Set[int],
+    target_group: Set[int],
+    G_full: np.ndarray,
+    h_full: np.ndarray,
+    A_eq_full: np.ndarray,
+    b_eq_full: np.ndarray,
+    supply: np.ndarray,
+    maximize_harm: bool,
+    verbose: bool,
+    solver: Optional[str] = None
+) -> Tuple[np.ndarray, str]:
+    """
+    Solve the inner optimization using a two-phase approach:
+    
+    Phase 1: Optimize attackers only
+        max sum_{a in attackers} log(V_a)
+        s.t. sum_{a in attackers} x_aj <= supply_j
+             x_aj >= 0
+             cutting plane constraints (projected to attacker space)
+    
+    Phase 2: Optimize non-attackers only
+        max sum_{i in non-attackers} log(V_i)
+        s.t. sum_{i in non-attackers} x_ij = supply_j - (attacker allocation for j)
+             x_ij >= 0
+    
+    This removes the need for swap-optimality constraints since non-attackers
+    are automatically Nash-optimal among themselves in Phase 2.
+    
+    Returns:
+        (x_optimal, status): Full allocation (flattened, n_agents * n_resources) and status
+    """
+    if solver is None:
+        solver = _DEFAULT_SOLVER
+    
+    attackers = sorted(list(attacking_group))
+    non_attackers = sorted(list(set(range(n_agents)) - attacking_group))
+    n_attackers = len(attackers)
+    n_non_attackers = len(non_attackers)
+    
+    if verbose:
+        print(f"  [TwoPhase] Phase 1: Optimizing {n_attackers} attackers")
+        print(f"  [TwoPhase] Phase 2: Optimizing {n_non_attackers} non-attackers")
+    
+    # Map from attacker index to local index
+    attacker_to_local = {a: i for i, a in enumerate(attackers)}
+    non_attacker_to_local = {a: i for i, a in enumerate(non_attackers)}
+    
+    n_attacker_vars = n_attackers * n_resources
+    n_full_vars = n_agents * n_resources
+    
+    # ========== PHASE 1: Attackers only ==========
+    
+    # Project cutting plane constraints to attacker space
+    # The full G matrix has rows of the form: [g_0, g_1, ..., g_{n_agents-1}] for each resource
+    # We need to extract only the attacker components
+    
+    # First, identify which rows in G_full are cutting planes (not base constraints)
+    # Base constraints are: x >= 0 (n_full_vars rows) and x <= supply (n_full_vars rows)
+    n_base_constraints = 2 * n_full_vars
+    
+    # Build attacker-only constraints
+    G_attacker_list = []
+    h_attacker_list = []
+    
+    # x >= 0 for attackers
+    G_attacker_list.append(-np.eye(n_attacker_vars))
+    h_attacker_list.append(np.zeros(n_attacker_vars))
+    
+    # x <= supply for each attacker variable
+    G_attacker_list.append(np.eye(n_attacker_vars))
+    h_attacker_list.append(np.tile(supply, n_attackers))
+    
+    # sum_a x_aj <= supply_j (inequality, not equality!)
+    G_supply = np.zeros((n_resources, n_attacker_vars))
+    for j in range(n_resources):
+        for local_i, a in enumerate(attackers):
+            G_supply[j, local_i * n_resources + j] = 1.0
+    G_attacker_list.append(G_supply)
+    h_attacker_list.append(supply.copy())
+    
+    # Project cutting plane constraints from full space to attacker space
+    # Cutting planes are the rows after the base constraints
+    if G_full.shape[0] > n_base_constraints:
+        for row_idx in range(n_base_constraints, G_full.shape[0]):
+            # Extract attacker components from this row
+            g_projected = np.zeros(n_attacker_vars)
+            for local_i, a in enumerate(attackers):
+                for j in range(n_resources):
+                    full_idx = a * n_resources + j
+                    local_idx = local_i * n_resources + j
+                    g_projected[local_idx] = G_full[row_idx, full_idx]
+            
+            # Only add if the projected constraint is non-trivial
+            if np.linalg.norm(g_projected) > 1e-10:
+                G_attacker_list.append(g_projected.reshape(1, -1))
+                h_attacker_list.append(np.array([h_full[row_idx]]))
+    
+    G_attacker = np.vstack(G_attacker_list)
+    h_attacker = np.concatenate(h_attacker_list)
+    
+    # No equality constraints for attackers (supply is inequality)
+    # But we need a dummy equality constraint for the solver interface
+    # Actually, let's just not pass equality constraints
+    
+    # Initial point for attackers: equal share
+    x0_attacker = np.zeros(n_attacker_vars)
+    for local_i in range(n_attackers):
+        x0_attacker[local_i * n_resources:(local_i + 1) * n_resources] = supply / n_agents
+    
+    # Solve Phase 1 using CVXOPT
+    try:
+        from cvxopt import matrix, solvers
+        solvers.options['show_progress'] = False
+        
+        # Utilities for attackers only
+        utilities_attacker = utilities[attackers, :]
+        
+        def F_attacker(x=None, z=None):
+            if x is None:
+                return (0, matrix(x0_attacker))
+            
+            x_np = np.array(x).flatten()
+            
+            # Compute utilities for attackers
+            V = []
+            for local_i in range(n_attackers):
+                v_i = 0.0
+                for j in range(n_resources):
+                    v_i += utilities_attacker[local_i, j] * x_np[local_i * n_resources + j]
+                V.append(max(v_i, 1e-12))
+            
+            # Objective: -sum log(V_i) (minimize negative = maximize)
+            f = sum(-np.log(v) for v in V)
+            
+            # Gradient
+            Df = matrix(0.0, (1, n_attacker_vars))
+            for local_i in range(n_attackers):
+                for j in range(n_resources):
+                    idx = local_i * n_resources + j
+                    Df[idx] = -utilities_attacker[local_i, j] / V[local_i]
+            
+            if z is None:
+                return (f, Df)
+            
+            # Hessian
+            H = matrix(0.0, (n_attacker_vars, n_attacker_vars))
+            for local_i in range(n_attackers):
+                for j1 in range(n_resources):
+                    for j2 in range(n_resources):
+                        idx1 = local_i * n_resources + j1
+                        idx2 = local_i * n_resources + j2
+                        H[idx1, idx2] = z[0] * utilities_attacker[local_i, j1] * utilities_attacker[local_i, j2] / (V[local_i] ** 2)
+            
+            return (f, Df, H)
+        
+        sol_attacker = solvers.cp(F_attacker, G=matrix(G_attacker), h=matrix(h_attacker))
+        
+        if sol_attacker['status'] not in ['optimal', 'unknown']:
+            if verbose:
+                print(f"  [TwoPhase] Phase 1 failed: {sol_attacker['status']}")
+            # Return equal allocation as fallback
+            x_full = np.zeros(n_full_vars)
+            for i in range(n_agents):
+                x_full[i * n_resources:(i + 1) * n_resources] = supply / n_agents
+            return x_full, sol_attacker['status']
+        
+        x_attacker = np.maximum(np.array(sol_attacker['x']).flatten(), 0)
+        
+        if verbose:
+            print(f"  [TwoPhase] Phase 1 complete, status={sol_attacker['status']}")
+        
+    except Exception as e:
+        if verbose:
+            print(f"  [TwoPhase] Phase 1 exception: {e}")
+        x_full = np.zeros(n_full_vars)
+        for i in range(n_agents):
+            x_full[i * n_resources:(i + 1) * n_resources] = supply / n_agents
+        return x_full, f"phase1_error: {e}"
+    
+    # ========== PHASE 2: Non-attackers only ==========
+    
+    # Compute remaining supply after attackers
+    attacker_allocation = np.zeros(n_resources)
+    for local_i, a in enumerate(attackers):
+        for j in range(n_resources):
+            attacker_allocation[j] += x_attacker[local_i * n_resources + j]
+    
+    remaining_supply = supply - attacker_allocation
+    remaining_supply = np.maximum(remaining_supply, 0)  # Ensure non-negative
+    
+    if verbose:
+        print(f"  [TwoPhase] Attacker allocation per resource: {attacker_allocation.round(6)}")
+        print(f"  [TwoPhase] Remaining supply for non-attackers: {remaining_supply.round(6)}")
+    
+    if n_non_attackers == 0:
+        # No non-attackers, just return attacker allocation
+        x_full = np.zeros(n_full_vars)
+        for local_i, a in enumerate(attackers):
+            for j in range(n_resources):
+                x_full[a * n_resources + j] = x_attacker[local_i * n_resources + j]
+        return x_full, 'optimal'
+    
+    # Check if there's any supply left for non-attackers
+    if np.all(remaining_supply < 1e-10):
+        # No supply left, give non-attackers zeros
+        x_full = np.zeros(n_full_vars)
+        for local_i, a in enumerate(attackers):
+            for j in range(n_resources):
+                x_full[a * n_resources + j] = x_attacker[local_i * n_resources + j]
+        # Non-attackers get zeros (already initialized)
+        return x_full, 'optimal'
+    
+    n_non_attacker_vars = n_non_attackers * n_resources
+    
+    # Initial point for non-attackers
+    x0_non_attacker = np.zeros(n_non_attacker_vars)
+    for local_i in range(n_non_attackers):
+        for j in range(n_resources):
+            if remaining_supply[j] > 1e-10:
+                x0_non_attacker[local_i * n_resources + j] = remaining_supply[j] / n_non_attackers
+    
+    try:
+        utilities_non_attacker = utilities[non_attackers, :]
+        
+        def F_non_attacker(x=None, z=None):
+            if x is None:
+                return (0, matrix(x0_non_attacker))
+            
+            x_np = np.array(x).flatten()
+            
+            # Compute utilities for non-attackers
+            V = []
+            for local_i in range(n_non_attackers):
+                v_i = 0.0
+                for j in range(n_resources):
+                    v_i += utilities_non_attacker[local_i, j] * x_np[local_i * n_resources + j]
+                V.append(max(v_i, 1e-12))
+            
+            # Objective: -sum log(V_i)
+            f = sum(-np.log(v) for v in V)
+            
+            # Gradient
+            Df = matrix(0.0, (1, n_non_attacker_vars))
+            for local_i in range(n_non_attackers):
+                for j in range(n_resources):
+                    idx = local_i * n_resources + j
+                    Df[idx] = -utilities_non_attacker[local_i, j] / V[local_i]
+            
+            if z is None:
+                return (f, Df)
+            
+            # Hessian
+            H = matrix(0.0, (n_non_attacker_vars, n_non_attacker_vars))
+            for local_i in range(n_non_attackers):
+                for j1 in range(n_resources):
+                    for j2 in range(n_resources):
+                        idx1 = local_i * n_resources + j1
+                        idx2 = local_i * n_resources + j2
+                        H[idx1, idx2] = z[0] * utilities_non_attacker[local_i, j1] * utilities_non_attacker[local_i, j2] / (V[local_i] ** 2)
+            
+            return (f, Df, H)
+        
+        # Inequality constraints: x >= 0
+        G_non_attacker = -np.eye(n_non_attacker_vars)
+        h_non_attacker = np.zeros(n_non_attacker_vars)
+        
+        # Equality constraints: sum_i x_ij = remaining_supply_j
+        A_non_attacker = np.zeros((n_resources, n_non_attacker_vars))
+        for j in range(n_resources):
+            for local_i in range(n_non_attackers):
+                A_non_attacker[j, local_i * n_resources + j] = 1.0
+        b_non_attacker = remaining_supply
+        
+        sol_non_attacker = solvers.cp(
+            F_non_attacker, 
+            G=matrix(G_non_attacker), 
+            h=matrix(h_non_attacker),
+            A=matrix(A_non_attacker),
+            b=matrix(b_non_attacker)
+        )
+        
+        if sol_non_attacker['status'] not in ['optimal', 'unknown']:
+            if verbose:
+                print(f"  [TwoPhase] Phase 2 failed: {sol_non_attacker['status']}")
+            # Use equal allocation for non-attackers as fallback
+            x_non_attacker = x0_non_attacker
+        else:
+            x_non_attacker = np.maximum(np.array(sol_non_attacker['x']).flatten(), 0)
+            if verbose:
+                print(f"  [TwoPhase] Phase 2 complete, status={sol_non_attacker['status']}")
+        
+    except Exception as e:
+        if verbose:
+            print(f"  [TwoPhase] Phase 2 exception: {e}")
+        x_non_attacker = x0_non_attacker
+    
+    # ========== Combine results ==========
+    x_full = np.zeros(n_full_vars)
+    
+    # Fill in attacker allocations
+    for local_i, a in enumerate(attackers):
+        for j in range(n_resources):
+            x_full[a * n_resources + j] = x_attacker[local_i * n_resources + j]
+    
+    # Fill in non-attacker allocations
+    for local_i, na in enumerate(non_attackers):
+        for j in range(n_resources):
+            x_full[na * n_resources + j] = x_non_attacker[local_i * n_resources + j]
+    
+    return x_full, 'optimal'
+
+
+def _solve_inner_optimization(
+    utilities: np.ndarray,
+    n_agents: int,
+    n_resources: int,
+    attacking_group: Set[int],
+    target_group: Set[int],
+    G: np.ndarray,
+    h: np.ndarray,
+    A_eq: np.ndarray,
+    b_eq: np.ndarray,
+    supply: np.ndarray,
+    maximize_harm: bool,
+    verbose: bool,
+    solver: Optional[str] = None,
+    use_two_phase: bool = True
+) -> Tuple[np.ndarray, str]:
+    """
+    Solve the inner optimization problem for the given constraints.
+    
+    The objective is: sum_{i in target} log(V_i)
+    
+    This maximizes/minimizes the Nash welfare of the target group.
+    
+    All agents are free variables with equality constraints sum_i x_ij = supply_j.
+    
+    Args:
+        utilities: Utility matrix
+        n_agents: Number of agents
+        n_resources: Number of resources
+        attacking_group: Set of attacker indices
+        target_group: Set of target indices
+        G: Inequality constraint matrix
+        h: Inequality constraint RHS
+        A_eq: Equality constraint matrix
+        b_eq: Equality constraint RHS
+        supply: Resource supply vector
+        maximize_harm: If True, minimize target utility
+        verbose: Print progress
+        solver: 'gurobi', 'cvxopt', or None (use default)
+        use_two_phase: If True, use two-phase optimization (attackers then non-attackers)
+    
+    Returns:
+        (x_optimal, status): Optimal allocation (flattened) and status
+    """
+    if solver is None:
+        solver = _DEFAULT_SOLVER
+    
+    # Use two-phase optimization by default (more efficient, no swap constraints needed)
+    if use_two_phase and not maximize_harm:
+        return _solve_inner_optimization_two_phase(
+            utilities, n_agents, n_resources, attacking_group, target_group,
+            G, h, A_eq, b_eq, supply, maximize_harm, verbose, solver
+        )
+    
+    # Fall back to single-phase optimization for maximize_harm or if two-phase disabled
+    # Try Gurobi first if requested
+    if solver == 'gurobi':
+        if _check_gurobi_available():
+            return _solve_inner_optimization_gurobi(
+                utilities, n_agents, n_resources, attacking_group, target_group,
+                G, h, A_eq, b_eq, supply, maximize_harm, verbose
+            )
+        else:
+            if verbose:
+                print("  [InnerOpt] Gurobi not available, falling back to CVXOPT")
+    
+    # Use CVXOPT
+    return _solve_inner_optimization_cvxopt(
+        utilities, n_agents, n_resources, attacking_group, target_group,
+        G, h, A_eq, b_eq, supply, maximize_harm, verbose
+    )
 
 
 def compute_optimal_self_benefit_constraint(
