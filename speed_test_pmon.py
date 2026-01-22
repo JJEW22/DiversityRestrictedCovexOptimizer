@@ -100,6 +100,7 @@ class TestCaseResult:
     cuts_from_projection: int = 0
     cuts_from_inner_solve: int = 0
     cut_details: Optional[List[Dict]] = None  # Details of each cutting plane added
+    dirderiv_timing_stats: Optional[Dict] = None  # Detailed timing from DirectionalDerivativeOracle
 
 
 class TimingTracker:
@@ -203,7 +204,7 @@ def run_single_test(n_agents: int, n_resources: int, n_attackers: int,
                     utilities: np.ndarray, supply: np.ndarray, 
                     attacking_group: Set[int], tracker: TimingTracker,
                     verbose: bool = False, use_projection: bool = True,
-                    use_two_phase: bool = True) -> TestCaseResult:
+                    use_two_phase: bool = True, use_integral_method: bool = False) -> TestCaseResult:
     """
     Run a single test case with the actual optimizer.
     
@@ -297,7 +298,9 @@ def run_single_test(n_agents: int, n_resources: int, n_attackers: int,
                     verbose=verbose,
                     debug=False,
                     use_projection=use_projection,
-                    use_two_phase=use_two_phase
+                    use_two_phase=use_two_phase,
+                    track_timing=True,  # Enable detailed timing in DirectionalDerivativeOracle
+                    use_integral_method=use_integral_method  # Use integral-based boundary finding
                 )
         finally:
             # Restore original functions
@@ -355,6 +358,7 @@ def run_single_test(n_agents: int, n_resources: int, n_attackers: int,
         cuts_from_projection = cp_debug_info.get('cuts_from_projection', 0) if cp_debug_info else 0
         cuts_from_inner_solve = cp_debug_info.get('cuts_from_inner_solve', 0) if cp_debug_info else 0
         cut_details = cp_debug_info.get('cut_details', []) if cp_debug_info else []
+        dirderiv_timing = cp_debug_info.get('dirderiv_timing_stats', None) if cp_debug_info else None
         
         return TestCaseResult(
             n_agents=n_agents,
@@ -369,7 +373,8 @@ def run_single_test(n_agents: int, n_resources: int, n_attackers: int,
             inner_solves=inner_solves,
             cuts_from_projection=cuts_from_projection,
             cuts_from_inner_solve=cuts_from_inner_solve,
-            cut_details=cut_details
+            cut_details=cut_details,
+            dirderiv_timing_stats=dirderiv_timing
         )
         
     except Exception as e:
@@ -393,7 +398,8 @@ def run_single_test(n_agents: int, n_resources: int, n_attackers: int,
 
 def run_speed_test(n_test_cases: int = 10, seed: Optional[int] = None, 
                    verbose: bool = False, config: Optional[Dict] = None,
-                   use_projection: bool = True, use_two_phase: bool = True) -> Tuple[List[TestCaseResult], Dict[str, TimingStats]]:
+                   use_projection: bool = True, use_two_phase: bool = True,
+                   use_integral_method: bool = False) -> Tuple[List[TestCaseResult], Dict[str, TimingStats]]:
     """
     Run speed test with random test cases.
     
@@ -402,6 +408,7 @@ def run_speed_test(n_test_cases: int = 10, seed: Optional[int] = None,
         seed: Random seed for reproducibility
         verbose: Enable verbose output
         config: Configuration dict for test case generation
+        use_integral_method: Use integral-based boundary finding instead of binary search
     
     Returns:
         (list of test case results, global timing stats)
@@ -428,7 +435,8 @@ def run_speed_test(n_test_cases: int = 10, seed: Optional[int] = None,
             tracker,
             verbose=verbose,
             use_projection=use_projection,
-            use_two_phase=use_two_phase
+            use_two_phase=use_two_phase,
+            use_integral_method=use_integral_method
         )
         
         print(f"  Completed in {result.total_time:.3f}s, cuts={result.cutting_planes_added}, "
@@ -498,6 +506,41 @@ def generate_timing_report(results: List[TestCaseResult], global_stats: Dict[str
     
     timing_rows.append([])
     timing_rows.append(["TOTAL", f"{total_time:.4f}", "", "", "100%"])
+    
+    # Add DirectionalDerivativeOracle sub-timing breakdown
+    # Aggregate timing from all test results
+    dirderiv_sub_ops = ['check_validity', 'binary_search', 'binary_search_nash_solves', 'compute_normal']
+    dirderiv_totals = {op: {'total': 0.0, 'count': 0} for op in dirderiv_sub_ops}
+    
+    for r in results:
+        if r.dirderiv_timing_stats:
+            for op in dirderiv_sub_ops:
+                if op in r.dirderiv_timing_stats:
+                    dirderiv_totals[op]['total'] += r.dirderiv_timing_stats[op]['total']
+                    dirderiv_totals[op]['count'] += r.dirderiv_timing_stats[op]['count']
+    
+    # Only add if we have data
+    if any(dirderiv_totals[op]['count'] > 0 for op in dirderiv_sub_ops):
+        timing_rows.append([])
+        timing_rows.append(["--- DirDeriv Oracle Breakdown ---", "", "", "", ""])
+        
+        # Get total dirderiv time for percentage calculation
+        dirderiv_total_time = global_stats.get('step2_dirderiv_oracle_check', TimingStats()).total_time
+        
+        for op in dirderiv_sub_ops:
+            stats = dirderiv_totals[op]
+            if stats['count'] > 0:
+                avg_time = stats['total'] / stats['count']
+                pct_of_dirderiv = (stats['total'] / dirderiv_total_time * 100) if dirderiv_total_time > 0 else 0
+                timing_rows.append([
+                    f"  dirderiv_{op}",
+                    f"{stats['total']:.4f}",
+                    str(stats['count']),
+                    f"{avg_time:.6f}",
+                    f"{pct_of_dirderiv:.1f}% of dirderiv",
+                    "",
+                    ""
+                ])
     
     # Summary table
     summary_rows = []
@@ -700,6 +743,8 @@ def main():
                         help="Enable projection-based optimization (default: true)")
     parser.add_argument("--two-phase", type=str, default="true", choices=["true", "false"], dest="two_phase",
                         help="Enable two-phase optimization (attackers then non-attackers) (default: true)")
+    parser.add_argument("--integral", type=str, default="false", choices=["true", "false"],
+                        help="Use integral-based boundary finding instead of binary search (default: false)")
     
     args = parser.parse_args()
     
@@ -740,8 +785,10 @@ def main():
     # Parse use_projection and use_two_phase
     use_projection = args.project.lower() == "true"
     use_two_phase = args.two_phase.lower() == "true"
+    use_integral = args.integral.lower() == "true"
     print(f"Using projection: {use_projection}")
     print(f"Using two-phase: {use_two_phase}")
+    print(f"Using integral method: {use_integral}")
     
     # Run tests
     results, global_stats = run_speed_test(
@@ -750,7 +797,8 @@ def main():
         verbose=args.verbose,
         config=config,
         use_projection=use_projection,
-        use_two_phase=use_two_phase
+        use_two_phase=use_two_phase,
+        use_integral_method=use_integral
     )
     
     # Generate reports

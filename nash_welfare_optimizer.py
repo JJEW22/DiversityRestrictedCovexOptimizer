@@ -134,15 +134,15 @@ def compute_normal_at_boundary(
     The directional derivative is:
         D(x) = Σ_a Σ_j (v_aj/V_a - v_dj/V_d) * x_aj
     
-    At the boundary, D(x) = 0. The gradient with respect to x_aj gives us the normal.
+    At the boundary, D(x) = 0. The gradient with respect to x_{a'j'} is:
+        ∂D/∂x_{a'j'} = -(r_{j'} + Σ_{a∈A} Σ_{j∈I: t_j≠∅} (x_{aj} / (|t_j| * |t_{j'}|)) * r_{j'} * (Σ_{t∈t_j∩t_{j'}} v_{tj}/V_t))
     
-    For the simple case (ignoring second-order terms from V_d depending on x):
-        ∂D/∂x_aj ≈ (v_aj/V_a - v_dj/V_d)
+    Where:
+        r_{j'} = min ratio for resource j' (v_dj'/V_d for any tied agent d)
+        t_j = set of tied dependent agents for resource j
+        t_j ∩ t_{j'} = intersection of tied agents for resources j and j'
     
-    The normal pointing toward the feasible region (where D >= 0) is this gradient.
-    The normal pointing toward the excluded zone is the negative.
-    
-    When multiple agents are tied for dependent, we average their contributions.
+    The normal pointing toward the excluded zone is the negative of this gradient.
     
     Args:
         x_full_boundary: Full allocation matrix at boundary point (n_agents x n_resources)
@@ -166,30 +166,74 @@ def compute_normal_at_boundary(
         for j in range(n_resources):
             ratios[i, j] = utilities[i, j] / V_i
     
-    # Use shared helper to find dependent ratios (forward direction = find_min=True)
-    dependent_ratios, _ = compute_dependent_ratios_for_all_resources(
-        x_full_boundary, ratios, non_attacking_group, n_resources, find_min=True
-    )
+    # For each resource j, find the set of tied dependent agents (non-attackers with 
+    # smallest v_dj/V_d who have allocation) and the minimum ratio r_j
+    tied_agents = [set() for _ in range(n_resources)]  # t_j for each resource
+    min_ratio = [None] * n_resources  # r_j for each resource
     
-    # Compute attacker ratios (average over attackers if multiple)
-    attacker_ratios = np.zeros(n_resources)
     for j in range(n_resources):
-        total = 0.0
-        count = 0
+        # Find the minimum ratio among non-attackers with allocation
+        min_r = float('inf')
+        for d in non_attacking_group:
+            if x_full_boundary[d, j] > ALLOCATION_THRESHOLD:  # Must have allocation
+                if ratios[d, j] < min_r:
+                    min_r = ratios[d, j]
+        
+        if min_r < float('inf'):
+            min_ratio[j] = min_r
+            # Find all agents tied at this minimum ratio
+            for d in non_attacking_group:
+                if x_full_boundary[d, j] > ALLOCATION_THRESHOLD:
+                    if abs(ratios[d, j] - min_r) < TIE_TOLERANCE:
+                        tied_agents[j].add(d)
+    
+    # Compute the gradient for each resource j' using the corrected formula:
+    # ∂D/∂x_{a'j'} = -(r_{j'} + Σ_{a∈A} Σ_{j∈I: t_j≠∅} (x_{aj} / (|t_j| * |t_{j'}|)) * r_{j'} * (Σ_{t∈t_j∩t_{j'}} v_{tj}/V_t))
+    # 
+    # Normal points toward excluded zone, so we negate: normal = -gradient
+    
+    normal_attacker = np.zeros(n_resources)
+    
+    for j_prime in range(n_resources):
+        # If t_{j'} is empty, the normal component for this resource is 0
+        if len(tied_agents[j_prime]) == 0:
+            normal_attacker[j_prime] = 0.0
+            continue
+        
+        r_j_prime = min_ratio[j_prime]
+        t_j_prime_size = len(tied_agents[j_prime])
+        
+        # Compute the sum term: Σ_{a∈A} Σ_{j∈I: t_j≠∅} (x_{aj} / (|t_j| * |t_{j'}|)) * r_{j'} * (Σ_{t∈t_j∩t_{j'}} v_{tj}/V_t)
+        sum_term = 0.0
         for a in attacking_group:
-            V_a = max(V_boundary[a], 1e-10)
-            total += utilities[a, j] / V_a
-            count += 1
-        attacker_ratios[j] = total / count if count > 0 else 0.0
-    
-    # The gradient of D with respect to attacker allocation x_aj is approximately:
-    # ∂D/∂x_aj ≈ (v_aj/V_a - v_dj/V_d)
-    # This points toward increasing D (toward feasible region)
-    # Normal toward excluded zone is the negative
-    gradient = attacker_ratios - dependent_ratios
-    
-    # Normal points toward excluded zone (where D < 0, i.e., where attackers want more)
-    normal_attacker = gradient  # Positive gradient means attacker wants more of this resource
+            for j in range(n_resources):
+                # Skip if t_j is empty
+                if len(tied_agents[j]) == 0:
+                    continue
+                
+                x_aj = x_full_boundary[a, j]
+                t_j_size = len(tied_agents[j])
+                
+                # Compute intersection t_j ∩ t_{j'}
+                intersection = tied_agents[j] & tied_agents[j_prime]
+                
+                # Compute inner sum: Σ_{t∈t_j∩t_{j'}} v_{tj}/V_t
+                inner_sum = 0.0
+                for t in intersection:
+                    V_t = max(V_boundary[t], 1e-10)
+                    v_tj = utilities[t, j]
+                    inner_sum += v_tj / V_t
+                
+                # Add contribution to sum term
+                sum_term += (x_aj / (t_j_size * t_j_prime_size)) * r_j_prime * inner_sum
+        
+        # Gradient = -(r_{j'} + sum_term)
+        # Everything inside parentheses is positive, so gradient is negative
+        gradient_j_prime = -(r_j_prime + sum_term)
+        
+        # Normal is negative of gradient (points toward excluded zone)
+        # Since gradient is negative, normal will be positive
+        normal_attacker[j_prime] = -gradient_j_prime
     
     # Normalize
     norm = np.linalg.norm(normal_attacker)
@@ -611,7 +655,7 @@ class NashWelfareOptimizer:
         self.n_resources = n_resources
         self.n_vars = n_agents * n_resources
         self.utilities = np.array(utilities)
-        self.supply = supply if supply is not None else np.ones(n_resources)
+        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
         self.agent_constraints: Dict[int, Optional[AgentDiversityConstraint]] = {
             i: None for i in range(n_agents)
         }
@@ -886,15 +930,17 @@ class DirectionalDerivativeOracle:
     
     def __init__(self, n_agents: int, n_resources: int, utilities: np.ndarray,
                  attacking_group: Set[int], supply: Optional[np.ndarray] = None,
-                 verbose: bool = False):
+                 verbose: bool = False, track_timing: bool = False,
+                 use_integral_method: bool = False):
         self.n_agents = n_agents
         self.n_resources = n_resources
         self.utilities = utilities
         self.attacking_group = attacking_group
         self.non_attacking_group = set(range(n_agents)) - attacking_group
-        self.supply = supply if supply is not None else np.ones(n_resources)
+        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
         self.verbose = verbose
         self.n_free_vars = n_agents * n_resources
+        self.use_integral_method = use_integral_method
         
         # Counters for debugging
         self.n_backward_checks = 0
@@ -902,6 +948,39 @@ class DirectionalDerivativeOracle:
         
         # Store the last computed boundary point (set by _find_separating_hyperplane)
         self.last_boundary_point = None
+        
+        # Timing tracking (enabled via track_timing=True)
+        self.track_timing = track_timing
+        self.timing_stats = {
+            'check_validity': {'total': 0.0, 'count': 0, 'times': []},
+            'binary_search': {'total': 0.0, 'count': 0, 'times': []},
+            'binary_search_nash_solves': {'total': 0.0, 'count': 0, 'times': []},
+            'compute_normal': {'total': 0.0, 'count': 0, 'times': []},
+        }
+    
+    def reset_timing_stats(self):
+        """Reset all timing statistics."""
+        for key in self.timing_stats:
+            self.timing_stats[key] = {'total': 0.0, 'count': 0, 'times': []}
+    
+    def get_timing_stats(self) -> Dict:
+        """Get timing statistics with computed averages."""
+        result = {}
+        for key, stats in self.timing_stats.items():
+            result[key] = {
+                'total': stats['total'],
+                'count': stats['count'],
+                'avg': stats['total'] / stats['count'] if stats['count'] > 0 else 0.0,
+                'times': stats['times'].copy()
+            }
+        return result
+    
+    def _record_timing(self, operation: str, elapsed: float):
+        """Record timing for an operation."""
+        if self.track_timing:
+            self.timing_stats[operation]['total'] += elapsed
+            self.timing_stats[operation]['count'] += 1
+            self.timing_stats[operation]['times'].append(elapsed)
     
     def _get_full_allocation(self, x_free: np.ndarray) -> np.ndarray:
         return x_free.reshape((self.n_agents, self.n_resources))
@@ -1030,8 +1109,13 @@ class DirectionalDerivativeOracle:
     
     def is_violated(self, x_free: np.ndarray) -> Tuple[bool, Optional[np.ndarray], Optional[float]]:
         """Check if the directional derivative constraint is violated."""
+        import time as _time
+        
         if self.verbose:
             print(f"  [DirDerivOracle.is_violated] Checking directional derivative...")
+        
+        # Start timing for check_validity
+        _t_check_start = _time.perf_counter()
         
         x_full = self._get_full_allocation(x_free)
         V = self._compute_utilities_from_allocation(x_full)
@@ -1046,13 +1130,20 @@ class DirectionalDerivativeOracle:
         non_attacker_zero_utility = any(V[i] <= 1e-10 for i in self.non_attacking_group)
         
         if non_attacker_zero_utility:
+            # Record check_validity time
+            self._record_timing('check_validity', _time.perf_counter() - _t_check_start)
+            
             if self.verbose:
                 print(f"    Non-attacker has zero utility - this means we've definitely overshot")
                 print(f"    (taking from them would be -∞ change, giving to them would be +∞ benefit)")
-                print(f"    Proceeding directly to binary search...")
+                print(f"    Proceeding directly to boundary search...")
             
-            # We've definitely overshot - go directly to binary search
-            normal, rhs = self._find_separating_hyperplane(x_free, x_full, V)
+            # We've definitely overshot - go directly to boundary search
+            # For integral method, we need a D_0 value - use a large negative number
+            if self.use_integral_method:
+                normal, rhs = self._find_separating_hyperplane_integral(x_free, x_full, V, -1.0)
+            else:
+                normal, rhs = self._find_separating_hyperplane(x_free, x_full, V)
             
             if self.verbose:
                 print(f"    Cutting plane: normal · x <= {rhs:.6f}")
@@ -1070,15 +1161,24 @@ class DirectionalDerivativeOracle:
                 print(f"    Forward directional derivative: {forward_deriv:.6e}")
             
             if forward_deriv >= -1e-8:
+                # Record check_validity time (not violated case)
+                self._record_timing('check_validity', _time.perf_counter() - _t_check_start)
+                
                 if self.verbose:
                     print(f"    -> NOT VIOLATED (forward dir_deriv >= 0)")
                 return False, None, None
+            
+            # Record check_validity time (violated case - before binary search)
+            self._record_timing('check_validity', _time.perf_counter() - _t_check_start)
             
             # Forward derivative is negative - we've overshot
             if self.verbose:
                 print(f"    -> VIOLATED (forward dir_deriv < 0), finding separating hyperplane...")
             
-            normal, rhs = self._find_separating_hyperplane(x_free, x_full, V)
+            if self.use_integral_method:
+                normal, rhs = self._find_separating_hyperplane_integral(x_free, x_full, V, forward_deriv)
+            else:
+                normal, rhs = self._find_separating_hyperplane(x_free, x_full, V)
             
             if self.verbose:
                 print(f"    Cutting plane: normal · x <= {rhs:.6f}")
@@ -1097,6 +1197,9 @@ class DirectionalDerivativeOracle:
             backward_direction, backward_valid = self._compute_direction(x_full, V, backward=True)
             
             if not backward_valid:
+                # Record check_validity time (not violated case)
+                self._record_timing('check_validity', _time.perf_counter() - _t_check_start)
+                
                 if self.verbose:
                     print(f"    Backward direction also invalid, returning not violated")
                 return False, None, None
@@ -1107,11 +1210,17 @@ class DirectionalDerivativeOracle:
                 print(f"    Backward directional derivative: {backward_deriv:.6e}")
             
             if backward_deriv <= 1e-8:
+                # Record check_validity time (not violated case)
+                self._record_timing('check_validity', _time.perf_counter() - _t_check_start)
+                
                 # Backward derivative is non-positive, meaning going backward wouldn't help
                 # We haven't overshot
                 if self.verbose:
                     print(f"    -> NOT VIOLATED (backward dir_deriv <= 0, we haven't overshot)")
                 return False, None, None
+            
+            # Record check_validity time (violated case - before binary search)
+            self._record_timing('check_validity', _time.perf_counter() - _t_check_start)
             
             # Backward derivative is positive - going backward would help
             # This means we've overshot in the forward direction
@@ -1120,9 +1229,14 @@ class DirectionalDerivativeOracle:
             
             if self.verbose:
                 print(f"    -> VIOLATED (backward dir_deriv > 0, we've overshot)")
-                print(f"    Finding separating hyperplane using binary search...")
+                print(f"    Finding separating hyperplane...")
             
-            normal, rhs = self._find_separating_hyperplane(x_free, x_full, V)
+            # For integral method with backward derivative, we use negative of backward_deriv
+            # since backward_deriv > 0 means we're past the boundary
+            if self.use_integral_method:
+                normal, rhs = self._find_separating_hyperplane_integral(x_free, x_full, V, -backward_deriv)
+            else:
+                normal, rhs = self._find_separating_hyperplane(x_free, x_full, V)
             
             if self.verbose:
                 print(f"    Cutting plane: normal · x <= {rhs:.6f}")
@@ -1139,6 +1253,12 @@ class DirectionalDerivativeOracle:
         2. Solve Nash welfare for non-attackers with remaining supply
         3. Compute directional derivative at this combined allocation
         """
+        import time as _time
+        
+        # Start timing for binary search
+        _t_bs_start = _time.perf_counter()
+        _t_nash_total = 0.0  # Accumulate Nash solve time
+        
         t_low, t_high = 0.0, 1.0
         
         # Get current attacker allocation
@@ -1180,8 +1300,10 @@ class DirectionalDerivativeOracle:
             
             remaining_supply = np.maximum(remaining_supply, 0)  # Clamp to non-negative
             
-            # Solve Nash welfare for non-attackers with remaining supply
+            # Solve Nash welfare for non-attackers with remaining supply (timed)
+            _t_nash_start = _time.perf_counter()
             non_attacker_allocation = self._solve_nash_for_non_attackers(remaining_supply)
+            _t_nash_total += _time.perf_counter() - _t_nash_start
             
             if non_attacker_allocation is None:
                 t_low = t_mid
@@ -1249,7 +1371,10 @@ class DirectionalDerivativeOracle:
             remaining_supply_boundary -= attacker_allocation_boundary[i]
         remaining_supply_boundary = np.maximum(remaining_supply_boundary, 0)
         
+        # Final Nash solve (timed)
+        _t_nash_start = _time.perf_counter()
         non_attacker_allocation_boundary = self._solve_nash_for_non_attackers(remaining_supply_boundary)
+        _t_nash_total += _time.perf_counter() - _t_nash_start
         
         x_full_boundary = np.zeros((self.n_agents, self.n_resources))
         for i in self.attacking_group:
@@ -1261,78 +1386,31 @@ class DirectionalDerivativeOracle:
         # Store the boundary point for later retrieval
         self.last_boundary_point = x_full_boundary.flatten().copy()
         
-        V_boundary = self._compute_utilities_from_allocation(x_full_boundary)
+        # Record binary search timing (excluding compute_normal)
+        _t_bs_end = _time.perf_counter()
+        self._record_timing('binary_search', _t_bs_end - _t_bs_start)
+        self._record_timing('binary_search_nash_solves', _t_nash_total)
         
-        # Count how many non-attackers share each resource (have allocation)
-        agents_per_resource = np.zeros(self.n_resources)
-        for j in range(self.n_resources):
-            for d in self.non_attacking_group:
-                if x_full_boundary[d, j] > 1e-10:
-                    agents_per_resource[j] += 1
+        # Start timing for compute_normal
+        _t_normal_start = _time.perf_counter()
         
-        # Compute v_ij/V_i for all agents at x*
-        ratios = np.zeros((self.n_agents, self.n_resources))
-        for i in range(self.n_agents):
-            V_i = max(V_boundary[i], 1e-10)
-            for j in range(self.n_resources):
-                ratios[i, j] = self.utilities[i, j] / V_i
+        # Use the standalone function to compute the normal vector (single point of control)
+        normal_attacker = compute_normal_at_boundary(
+            x_full_boundary, self.utilities, self.attacking_group,
+            self.non_attacking_group, self.n_agents, self.n_resources
+        )
         
-        # For each resource j, find the dependent agent (non-attacker with smallest v_dj/V_d who has allocation)
-        dependent_agent = [None] * self.n_resources
-        for j in range(self.n_resources):
-            min_ratio = float('inf')
-            min_agent = None
-            for d in self.non_attacking_group:
-                if x_full_boundary[d, j] > 1e-10:  # Must have allocation
-                    if ratios[d, j] < min_ratio:
-                        min_ratio = ratios[d, j]
-                        min_agent = d
-            dependent_agent[j] = min_agent
-        
-        # Compute total attacker allocation for each resource: S_a(k)
-        S_a = np.zeros(self.n_resources)
-        for k in range(self.n_resources):
-            for a in self.attacking_group:
-                S_a[k] += x_full_boundary[a, k]
-        
-        # Compute the gradient for each resource j using corrected formula
-        # ∂D/∂x_aj = -[(v_dj / V_d) - (v_dj / (V_d² * agents_per_resource[j])) * Σ_{k: d_k = d_j} S_a(k) * v_dk]
-        # Normal points toward excluded zone, so we negate: normal = -gradient
+        # Expand to full space: normal is only for attacker dimensions
+        # All non-attacker components are 0
         normal_full = np.zeros((self.n_agents, self.n_resources))
-        
-        for j in range(self.n_resources):
-            d_j = dependent_agent[j]
-            if d_j is None:
-                continue
-            
-            V_d = V_boundary[d_j]
-            v_dj = self.utilities[d_j, j]
-            
-            # Compute the sum: Σ_{k: d_k = d_j} S_a(k) * v_dk
-            sum_term = 0.0
-            for k in range(self.n_resources):
-                if dependent_agent[k] == d_j:
-                    v_dk = self.utilities[d_j, k]
-                    sum_term += S_a[k] * v_dk
-            
-            # Compute gradient component
-            if agents_per_resource[j] > 0:
-                gradient_j = -((v_dj / V_d) + (v_dj / (V_d**2 * agents_per_resource[j])) * sum_term)
-            else:
-                gradient_j = -(v_dj / V_d)
-            
-            # Normal is negative of gradient (points toward excluded zone)
-            # Set for all attackers (they share the same normal for resource j)
-            for a in self.attacking_group:
-                normal_full[a, j] = -gradient_j
+        for a in self.attacking_group:
+            normal_full[a] = normal_attacker
         
         normal = normal_full.flatten()
         
-        # Normalize
+        # Handle zero normal case
         norm = np.linalg.norm(normal)
-        if norm > 1e-10:
-            normal = normal / norm
-        else:
+        if norm < 1e-10:
             # Fallback: use direction from x* to x_violating directly
             if saved_verbose:
                 print(f"      WARNING: Normal is zero, falling back to direction vector")
@@ -1342,6 +1420,9 @@ class DirectionalDerivativeOracle:
             norm = np.linalg.norm(normal)
             if norm > 1e-10:
                 normal = normal / norm
+        
+        # Record compute_normal timing
+        self._record_timing('compute_normal', _time.perf_counter() - _t_normal_start)
         
         x_boundary_flat = x_full_boundary.flatten()
         
@@ -1359,20 +1440,446 @@ class DirectionalDerivativeOracle:
         rhs = boundary_dot
         
         if saved_verbose:
+            V_boundary = self._compute_utilities_from_allocation(x_full_boundary)
             print(f"      Boundary point found:")
             print(f"        V at boundary: {V_boundary.round(6)}")
-            print(f"        Dependent agents: {dependent_agent}")
-            print(f"        Agents per resource: {agents_per_resource}")
-            print(f"        S_a (attacker allocation): {S_a.round(6)}")
-            print(f"        Normal (attacker components):")
-            for a in self.attacking_group:
-                print(f"          Agent {a}: {normal_full[a].round(6)}")
+            print(f"        Normal (attacker components): {normal_attacker.round(6)}")
             print(f"        rhs = normal · x* = {rhs:.6f}")
             print(f"        Violating point: normal · x_free = {violating_dot:.6f}")
             violation = violating_dot - rhs
             print(f"        Violation (lhs - rhs): {violation:.6f} (should be > 0)")
             print(f"    ╔══════════════════════════════════════════════════════════════════╗")
             print(f"    ║          BINARY SEARCH FOR BOUNDARY - END                        ║")
+            print(f"    ╚══════════════════════════════════════════════════════════════════╝")
+            print(f"")
+        
+        return normal, rhs
+    
+    def _solve_integral_step(self, V: np.ndarray, direction: np.ndarray, D_current: float, debug: bool = False) -> float:
+        """
+        Solve for step size x using the integral formula.
+        
+        We want to find x such that:
+            integral_0^x sum_i (delta_V_i / (V_i + delta_V_i * t)) dt = -D_current
+        
+        Which gives:
+            sum_i ln((V_i + delta_V_i * x) / V_i) = -D_current
+            prod_i ((V_i + delta_V_i * x) / V_i) = exp(-D_current)
+        
+        This is a polynomial in x. We solve it numerically using Newton's method
+        or bisection.
+        
+        Args:
+            V: Current utilities for all agents
+            direction: Direction matrix (n_agents, n_resources)
+            D_current: Current directional derivative value
+            debug: If True, print debug information
+            
+        Returns:
+            x: Step size to reach the boundary (estimated)
+        """
+        # Compute delta_V_i = d_i · v_i for each agent
+        delta_V = np.array([
+            np.dot(direction[i], self.utilities[i]) 
+            for i in range(self.n_agents)
+        ])
+        
+        target = np.exp(-D_current)
+        
+        if debug:
+            print(f"\n      [_solve_integral_step DEBUG]")
+            print(f"        D_current = {D_current:.6e}")
+            print(f"        target = exp(-D_current) = {target:.6f}")
+            print(f"\n        Per-agent details:")
+            for i in range(self.n_agents):
+                role = "ATK" if i in self.attacking_group else "DEF"
+                print(f"          Agent {i} ({role}):")
+                print(f"            v[{i}] (utilities) = {self.utilities[i].round(6)}")
+                print(f"            d[{i}] (direction) = {direction[i].round(6)}")
+                print(f"            V[{i}] (total utility) = {V[i]:.6f}")
+                print(f"            delta_V[{i}] = d·v = {delta_V[i]:.6f}")
+                if V[i] > 1e-10:
+                    print(f"            delta_V[{i}]/V[{i}] = {delta_V[i]/V[i]:.6f}")
+            print(f"\n        delta_V = {delta_V.round(6)}")
+            print(f"        V = {V.round(6)}")
+            # Verify: sum(delta_V / V) should equal D_current
+            D_check = sum(delta_V[i] / V[i] for i in range(self.n_agents) if V[i] > 1e-10)
+            print(f"        Verification: sum(delta_V/V) = {D_check:.6e} (should equal D_current)")
+        
+        # Define the function f(x) = prod_i ((V_i + delta_V_i * x) / V_i) - target
+        # We want to find x where f(x) = 0
+        
+        def f(x):
+            product = 1.0
+            for i in range(self.n_agents):
+                if abs(V[i]) < 1e-10:
+                    continue
+                ratio = (V[i] + delta_V[i] * x) / V[i]
+                if ratio <= 0:
+                    return float('inf') if x > 0 else float('-inf')
+                product *= ratio
+            return product - target
+        
+        def f_derivative(x):
+            """Derivative of f(x) for Newton's method."""
+            # d/dx prod_i (1 + delta_V_i * x / V_i) 
+            # = sum_j (delta_V_j / V_j) * prod_{i != j} (1 + delta_V_i * x / V_i)
+            # = prod_i (1 + delta_V_i * x / V_i) * sum_j (delta_V_j / (V_j + delta_V_j * x))
+            product = 1.0
+            sum_term = 0.0
+            for i in range(self.n_agents):
+                if abs(V[i]) < 1e-10:
+                    continue
+                denom = V[i] + delta_V[i] * x
+                if abs(denom) < 1e-10:
+                    return float('inf')
+                ratio = (V[i] + delta_V[i] * x) / V[i]
+                if ratio <= 0:
+                    return float('inf')
+                product *= ratio
+                sum_term += delta_V[i] / denom
+            return product * sum_term
+        
+        if debug:
+            print(f"        f(0) = {f(0):.6f} (should be 1 - target = {1 - target:.6f})")
+            # Test positive x values in [0, 1] range (direction vector handles the sign)
+            for test_x in [0.1, 0.2, 0.5, 0.8, 1.0]:
+                fx = f(test_x)
+                if not np.isinf(fx):
+                    print(f"        f({test_x:.1f}) = {fx:.6f}")
+                else:
+                    print(f"        f({test_x:.1f}) = inf (invalid - ratio went negative)")
+        
+        # Use Newton's method with bisection fallback
+        # x should always be positive in [0, 1] since direction vector handles the sign
+        # - For backward direction: direction[a] = -x_current[a], so x in [0,1] scales down
+        # - For forward direction: direction[a] = +x_current[a], so x in [0,1] scales up (but not beyond 2x)
+        
+        f_0 = f(0)
+        f_1 = f(1.0)
+        
+        if debug:
+            print(f"        f(0) = {f_0:.6f}, f(1) = {f_1:.6f}")
+        
+        # Check if root is in [0, 1]
+        if f_0 * f_1 < 0:
+            # Root is in [0, 1]
+            x_lo, x_hi = 0.0, 1.0
+        elif abs(f_0) < 1e-10:
+            # Already at root
+            if debug:
+                print(f"        Already at root (f(0) ≈ 0)")
+            return 0.0
+        elif abs(f_1) < 1e-10:
+            # Root at x=1
+            if debug:
+                print(f"        Root at x=1")
+            return 1.0
+        else:
+            # Root might be beyond x=1, search further
+            x_lo, x_hi = 0.0, 1.0
+            if f_0 * f_1 > 0:
+                # Same sign, need to extend search
+                if debug:
+                    print(f"        No sign change in [0,1], extending search...")
+                # Try extending to [0, 2] or beyond
+                for x_test in [1.5, 2.0, 3.0, 5.0]:
+                    f_test = f(x_test)
+                    if debug:
+                        print(f"        f({x_test}) = {f_test:.6f}")
+                    if not np.isinf(f_test) and f_0 * f_test < 0:
+                        x_hi = x_test
+                        break
+                else:
+                    if debug:
+                        print(f"        WARNING: Could not find bracket, using x=0.5 as fallback")
+                    return 0.5
+        
+        if debug:
+            print(f"        Bracket: [{x_lo:.6f}, {x_hi:.6f}]")
+            print(f"        f(x_lo) = {f(x_lo):.6f}, f(x_hi) = {f(x_hi):.6f}")
+        
+        # Newton's method with bisection fallback
+        x = (x_lo + x_hi) / 2
+        for iteration in range(50):
+            fx = f(x)
+            
+            if abs(fx) < 1e-10:
+                break
+                
+            # Try Newton step
+            fpx = f_derivative(x)
+            if abs(fpx) > 1e-10:
+                x_newton = x - fx / fpx
+                # Accept Newton step if it's within bracket and makes progress
+                if x_lo < x_newton < x_hi:
+                    x_new = x_newton
+                else:
+                    # Bisection step
+                    x_new = (x_lo + x_hi) / 2
+            else:
+                # Bisection step
+                x_new = (x_lo + x_hi) / 2
+            
+            # Update bracket
+            if f(x_new) * f(x_lo) < 0:
+                x_hi = x_new
+            else:
+                x_lo = x_new
+            
+            x = x_new
+            
+            if abs(x_hi - x_lo) < 1e-12:
+                break
+        
+        if debug:
+            print(f"        Solution: x = {x:.6f}")
+            print(f"        Verification: f(x) = {f(x):.6e}")
+        
+        return x
+    
+    def _find_separating_hyperplane_integral(self, x_free: np.ndarray, x_full: np.ndarray,
+                                              V: np.ndarray, D_0: float) -> Tuple[np.ndarray, float]:
+        """
+        Find separating hyperplane using integral-based stepping.
+        
+        Instead of binary search, we use the integral formula to estimate
+        the step size to reach the boundary, then refine with additional steps.
+        
+        Args:
+            x_free: Original free variables (flattened)
+            x_full: Original allocation matrix
+            V: Original utilities
+            D_0: Original directional derivative (should be negative)
+        """
+        import time as _time
+        
+        # Start timing
+        _t_bs_start = _time.perf_counter()
+        _t_nash_total = 0.0
+        n_iterations = 0
+        
+        saved_verbose = self.verbose
+        
+        # Current state
+        x_current = x_full.copy()
+        V_current = V.copy()
+        D_current = D_0
+        
+        # Track cumulative scaling factor (starts at 1.0 = original point)
+        t_cumulative = 1.0
+        
+        # Original attacker allocation (we scale from this)
+        attacker_allocation_original = {}
+        for i in self.attacking_group:
+            attacker_allocation_original[i] = x_full[i].copy()
+        
+        if saved_verbose:
+            print(f"")
+            print(f"    ╔══════════════════════════════════════════════════════════════════╗")
+            print(f"    ║       INTEGRAL-BASED BOUNDARY SEARCH - START                     ║")
+            print(f"    ╚══════════════════════════════════════════════════════════════════╝")
+            print(f"      Initial D_0 = {D_0:.6e}")
+        
+        max_iterations = 20
+        
+        for iteration in range(max_iterations):
+            n_iterations += 1
+            
+            # Choose direction based on D_current:
+            # D < 0: attackers have too much, need to scale DOWN → use BACKWARD direction
+            # D > 0: attackers have too little, need to scale UP → use FORWARD direction
+            
+            use_backward = (D_current < 0)
+            
+            self.verbose = False
+            direction, direction_valid = self._compute_direction(x_current, V_current, backward=use_backward)
+            self.verbose = saved_verbose
+            
+            if not direction_valid:
+                # Try the other direction as fallback
+                self.verbose = False
+                direction, direction_valid = self._compute_direction(x_current, V_current, backward=(not use_backward))
+                use_backward = not use_backward
+                self.verbose = saved_verbose
+                
+                if not direction_valid:
+                    if saved_verbose:
+                        print(f"      [Iter {iteration}] No valid direction, stopping")
+                    break
+            
+            if saved_verbose:
+                print(f"      [Iter {iteration}] D={D_current:+.6e}, using {'BACKWARD' if use_backward else 'FORWARD'} direction")
+            
+            # Solve for step size using integral formula
+            x_step = self._solve_integral_step(V_current, direction, D_current, debug=saved_verbose)
+            
+            if saved_verbose:
+                print(f"      [Iter {iteration}] integral step x={x_step:.6f}")
+            
+            # The step x_step is in "direction units"
+            # For FORWARD direction: direction[a] = +x_current[a]
+            #   new_alloc = x_current + x_step * direction = x_current * (1 + x_step)
+            #   t_new = t_cumulative * (1 + x_step)
+            #
+            # For BACKWARD direction: direction[a] = -x_current[a]  
+            #   new_alloc = x_current + x_step * direction = x_current * (1 - x_step)
+            #   t_new = t_cumulative * (1 - x_step)
+            
+            if use_backward:
+                t_new = t_cumulative * (1 - x_step)
+            else:
+                t_new = t_cumulative * (1 + x_step)
+            
+            # Clamp to valid range
+            t_new = max(0.0, min(1.0, t_new))
+            
+            if saved_verbose:
+                print(f"      [Iter {iteration}] t_cumulative: {t_cumulative:.6f} -> {t_new:.6f}")
+            
+            # Check for convergence (no progress)
+            if abs(t_new - t_cumulative) < 1e-10:
+                if saved_verbose:
+                    print(f"      [Iter {iteration}] No progress, stopping")
+                break
+            
+            t_cumulative = t_new
+            
+            # Compute new attacker allocation
+            attacker_allocation_new = {}
+            for i in self.attacking_group:
+                attacker_allocation_new[i] = attacker_allocation_original[i] * t_cumulative
+            
+            # Compute remaining supply
+            remaining_supply = self.supply.copy()
+            for i in self.attacking_group:
+                remaining_supply -= attacker_allocation_new[i]
+            
+            if np.any(remaining_supply < -1e-10):
+                if saved_verbose:
+                    print(f"      [Iter {iteration}] Negative supply, adjusting t_cumulative")
+                # Scale back to valid range
+                t_cumulative = t_cumulative * 0.9
+                continue
+            
+            remaining_supply = np.maximum(remaining_supply, 0)
+            
+            # Nash solve for non-attackers
+            _t_nash_start = _time.perf_counter()
+            non_attacker_allocation = self._solve_nash_for_non_attackers(remaining_supply)
+            _t_nash_total += _time.perf_counter() - _t_nash_start
+            
+            if non_attacker_allocation is None:
+                if saved_verbose:
+                    print(f"      [Iter {iteration}] Nash solve failed")
+                t_cumulative = t_cumulative * 0.9
+                continue
+            
+            # Build new full allocation
+            x_current = np.zeros((self.n_agents, self.n_resources))
+            for i in self.attacking_group:
+                x_current[i] = attacker_allocation_new[i]
+            for i in self.non_attacking_group:
+                x_current[i] = non_attacker_allocation[i]
+            
+            V_current = self._compute_utilities_from_allocation(x_current)
+            
+            if np.any(V_current <= 1e-10):
+                if saved_verbose:
+                    print(f"      [Iter {iteration}] Zero utility, adjusting")
+                t_cumulative = t_cumulative * 0.9
+                continue
+            
+            # Compute new directional derivative
+            self.verbose = False
+            new_direction, new_valid = self._compute_direction(x_current, V_current, backward=False)
+            self.verbose = saved_verbose
+            
+            if new_valid:
+                self.verbose = False
+                D_current = self._compute_directional_derivative_with_direction(x_current, V_current, new_direction)
+                self.verbose = saved_verbose
+            else:
+                # Try backward
+                self.verbose = False
+                new_direction, new_valid = self._compute_direction(x_current, V_current, backward=True)
+                if new_valid:
+                    D_current = self._compute_directional_derivative_with_direction(x_current, V_current, new_direction)
+                self.verbose = saved_verbose
+            
+            if saved_verbose:
+                print(f"      [Iter {iteration}] After step: t={t_cumulative:.6f}, D={D_current:+.6e}")
+            
+            # Check convergence
+            if abs(D_current) < 1e-8:
+                if saved_verbose:
+                    print(f"      Converged at iteration {iteration}")
+                break
+        
+        if saved_verbose:
+            print(f"      Final: t_cumulative={t_cumulative:.6f}, D={D_current:+.6e}, iterations={n_iterations}")
+        
+        # Final boundary point
+        x_full_boundary = x_current.copy()
+        
+        # Store the boundary point
+        self.last_boundary_point = x_full_boundary.flatten().copy()
+        
+        # Record timing
+        _t_bs_end = _time.perf_counter()
+        self._record_timing('binary_search', _t_bs_end - _t_bs_start)
+        self._record_timing('binary_search_nash_solves', _t_nash_total)
+        
+        # Compute normal
+        _t_normal_start = _time.perf_counter()
+        
+        normal_attacker = compute_normal_at_boundary(
+            x_full_boundary, self.utilities, self.attacking_group,
+            self.non_attacking_group, self.n_agents, self.n_resources
+        )
+        
+        normal_full = np.zeros((self.n_agents, self.n_resources))
+        for a in self.attacking_group:
+            normal_full[a] = normal_attacker
+        
+        normal = normal_full.flatten()
+        
+        norm = np.linalg.norm(normal)
+        if norm < 1e-10:
+            if saved_verbose:
+                print(f"      WARNING: Normal is zero, falling back to direction vector")
+            x_violating_full = self._get_full_allocation(x_free)
+            direction = x_violating_full - x_full_boundary
+            normal = direction.flatten()
+            norm = np.linalg.norm(normal)
+            if norm > 1e-10:
+                normal = normal / norm
+        
+        self._record_timing('compute_normal', _time.perf_counter() - _t_normal_start)
+        
+        x_boundary_flat = x_full_boundary.flatten()
+        
+        boundary_dot = np.dot(normal, x_boundary_flat)
+        violating_dot = np.dot(normal, x_free)
+        
+        if violating_dot < boundary_dot:
+            normal = -normal
+            boundary_dot = -boundary_dot
+            violating_dot = -violating_dot
+        
+        rhs = boundary_dot
+        
+        if saved_verbose:
+            V_boundary = self._compute_utilities_from_allocation(x_full_boundary)
+            print(f"      Boundary point found:")
+            print(f"        V at boundary: {V_boundary.round(6)}")
+            print(f"        Normal (attacker components): {normal_attacker.round(6)}")
+            print(f"        rhs = normal · x* = {rhs:.6f}")
+            print(f"        Violating point: normal · x_free = {violating_dot:.6f}")
+            violation = violating_dot - rhs
+            print(f"        Violation (lhs - rhs): {violation:.6f} (should be > 0)")
+            print(f"    ╔══════════════════════════════════════════════════════════════════╗")
+            print(f"    ║       INTEGRAL-BASED BOUNDARY SEARCH - END                       ║")
             print(f"    ╚══════════════════════════════════════════════════════════════════╝")
             print(f"")
         
@@ -1516,7 +2023,7 @@ class SwapOptimalityOracle:
         self.utilities = utilities
         self.attacking_group = attacking_group
         self.non_attacking_group = set(range(n_agents)) - attacking_group
-        self.supply = supply if supply is not None else np.ones(n_resources)
+        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
         self.verbose = verbose
         self.n_free_vars = n_agents * n_resources
         
@@ -1585,8 +2092,13 @@ class SwapOptimalityOracle:
                     ratio_j_rounded = round_to_sig_figs(ratio_j, 3)
                     
                     improvement = ratio_j - ratio_i
-                    # Require improvement >= 0.001 and rounded ratios to differ
-                    if ratio_j_rounded > ratio_i_rounded and improvement >= 0.001:
+                    
+                    # Weight the improvement by the giver's allocation
+                    # This measures the actual utility benefit, not just the rate
+                    weighted_improvement = improvement * x_full[i, r]
+                    
+                    # Require weighted improvement >= 1e-4 and rounded ratios to differ
+                    if ratio_j_rounded > ratio_i_rounded and weighted_improvement >= 1e-4:
                         if improvement > best_improvement:
                             best_improvement = improvement
                             best_swap = (i, j, r)
@@ -1675,7 +2187,7 @@ class OptimalBoundaryOracle:
         self.utilities = utilities
         self.attacking_group = attacking_group
         self.non_attacking_group = set(range(n_agents)) - attacking_group
-        self.supply = supply if supply is not None else np.ones(n_resources)
+        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
         self.verbose = verbose
         self.n_free_vars = n_agents * n_resources
         
@@ -1791,7 +2303,9 @@ def _solve_optimal_constraint_convex_program(
     verbose: bool = False,
     debug: bool = False,
     use_projection: bool = True,
-    use_two_phase: bool = True
+    use_two_phase: bool = True,
+    track_timing: bool = False,
+    use_integral_method: bool = False
 ) -> Tuple[Optional[Dict[int, np.ndarray]], np.ndarray, str]:
     """
     Solve the convex program to find optimal proportionality constraints.
@@ -1817,20 +2331,22 @@ def _solve_optimal_constraint_convex_program(
         verbose: Print progress
         debug: Print detailed debug information
         use_projection: If True, use projection-based optimization; if False, always use inner solve
+        track_timing: If True, enable detailed timing in DirectionalDerivativeOracle
+        use_integral_method: If True, use integral-based boundary finding instead of binary search
     
     Returns:
         Tuple of:
         - optimal_directions: Dict mapping attacker agent_id -> ratio vector, or None
         - final_allocation: The resulting allocation matrix
         - status: 'optimal', 'infeasible', or error message
-        - cp_debug_info: Dict with debug info about the convex program
+        - cp_debug_info: Dict with debug info about the convex program (includes dirderiv_timing_stats if track_timing=True)
     """
     # Debug implies verbose
     if debug:
         verbose = True
     
     n_agents, n_resources = utilities.shape
-    supply = supply if supply is not None else np.ones(n_resources)
+    supply = supply if supply is not None else np.ones(n_resources) * n_agents
     
     if verbose:
         print(f"  [ConvexProgram] n_agents={n_agents}, n_resources={n_resources}")
@@ -1840,7 +2356,7 @@ def _solve_optimal_constraint_convex_program(
     
     # Create both oracles separately
     swap_oracle = SwapOptimalityOracle(n_agents, n_resources, utilities, attacking_group, supply, verbose=debug)
-    dir_deriv_oracle = DirectionalDerivativeOracle(n_agents, n_resources, utilities, attacking_group, supply, verbose=debug)
+    dir_deriv_oracle = DirectionalDerivativeOracle(n_agents, n_resources, utilities, attacking_group, supply, verbose=debug, track_timing=track_timing, use_integral_method=use_integral_method)
     
     # All agents are free variables now
     n_free_vars = n_agents * n_resources
@@ -2176,7 +2692,8 @@ def _solve_optimal_constraint_convex_program(
         'failure_reason': None if converged else 'max_iterations_reached',
         'cut_details': cut_details,
         'projection_iterations': n_projection_iterations,
-        'inner_solves': n_inner_solves
+        'inner_solves': n_inner_solves,
+        'dirderiv_timing_stats': dir_deriv_oracle.get_timing_stats() if track_timing else None
     }
     
     return optimal_directions, x_full, 'optimal', cp_debug_info
@@ -3111,7 +3628,7 @@ def compute_optimal_self_benefit_constraint(
         verbose = True
     
     n_agents, n_resources = utilities.shape
-    supply = supply if supply is not None else np.ones(n_resources)
+    supply = supply if supply is not None else np.ones(n_resources) * n_agents
     initial_constraints = initial_constraints or {}
     
     # Default victim group: all non-attackers
@@ -3462,7 +3979,7 @@ def compute_optimal_harm_constraint(
         verbose = True
     
     n_agents, n_resources = utilities.shape
-    supply = supply if supply is not None else np.ones(n_resources)
+    supply = supply if supply is not None else np.ones(n_resources) * n_agents
     initial_constraints = initial_constraints or {}
     
     if debug:
