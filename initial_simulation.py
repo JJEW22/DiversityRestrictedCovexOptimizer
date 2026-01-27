@@ -24,7 +24,7 @@ from datetime import datetime
 # Import from nash_welfare_optimizer
 from nash_welfare_optimizer import (
     NashWelfareOptimizer,
-    _solve_optimal_constraint_convex_program,
+    compute_optimal_self_benefit_constraint,
 )
 
 
@@ -47,6 +47,8 @@ class SimulationResult:
     q_nee_individual: Dict[int, float]  # agent_id -> q_nee (non-attackers only)
     V_initial: np.ndarray
     V_final: np.ndarray
+    nash_welfare_initial: float
+    nash_welfare_final: float
 
 
 def generate_utilities_rod_cutting(n_agents: int, n_resources: int, seed: int) -> np.ndarray:
@@ -86,7 +88,8 @@ def geometric_mean(values: List[float]) -> float:
 
 def run_simulation(attacker_size: int, defender_size: int, n_resources: int, 
                    seed: int, n_agents: int = 10, verbose: bool = False,
-                   use_projection: bool = True, use_integral_method: bool = False) -> SimulationResult:
+                   use_projection: bool = True, use_integral_method: bool = False,
+                   debug: bool = False) -> SimulationResult:
     """Run a single simulation.
     
     Args:
@@ -98,6 +101,7 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         verbose: Print verbose output
         use_projection: Use projection method (default True)
         use_integral_method: Use integral-based boundary finding (default False, uses binary search)
+        debug: Print detailed debug output (default False)
     """
     
     start_time = time.perf_counter()
@@ -115,40 +119,46 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         print(f"  Defenders: {defending_group}")
         print(f"  Non-attackers: {non_attacking_group}")
     
-    # Step 1: Initial Nash welfare solution
-    optimizer = NashWelfareOptimizer(n_agents, n_resources, utilities, supply)
-    initial_result = optimizer.solve(verbose=False)
-    x_initial = initial_result.allocation
-    V_initial = np.array([np.dot(x_initial[i], utilities[i]) for i in range(n_agents)])
-    
-    if verbose:
-        print(f"  Initial utilities: {V_initial.round(4)}")
-    
-    # Steps 2-3: Find p-MON constraint using convex program solver
-    # For p-MON, attacking_group = target_group, maximize_harm = False
+    # Use compute_optimal_self_benefit_constraint which does all 4 steps:
+    # Step 1: Compute initial Nash welfare allocation
+    # Step 2-3: Find optimal constraints via convex program
+    # Step 4: Re-solve Nash welfare with constraints to get final allocation
     try:
-        optimal_directions, x_final, status, cp_debug_info = _solve_optimal_constraint_convex_program(
+        constraints, info = compute_optimal_self_benefit_constraint(
             utilities=utilities,
             attacking_group=attacking_group,
-            target_group=attacking_group,  # For p-MON, target is the attackers themselves
+            victim_group=defending_group if defending_group else None,
             supply=supply,
-            maximize_harm=False,  # Minimize p-MON (maximize attacker utility)
-            verbose=False,
+            verbose=verbose or debug,
+            debug=debug,
             use_projection=use_projection,
             use_integral_method=use_integral_method,
         )
         
-        converged = cp_debug_info.get('converged', True)
-        n_iterations = cp_debug_info.get('iterations', 0)
+        # Extract results from info dict
+        V_initial = info['initial_utilities']
+        V_final = info['final_utilities']
+        x_initial = info['initial_allocation']
+        x_final = info['final_allocation']
+        converged = info.get('status') == 'optimal' or info.get('status') == 'no_benefit'
+        n_iterations = info.get('cp_debug_info', {}).get('iterations', 0) if 'cp_debug_info' in info else 0
         
-        # x_final is already the final allocation after applying the constraint
+        if verbose:
+            print(f"  V_initial: {V_initial.round(6)}")
+            print(f"  V_final: {V_final.round(6)}")
+            print(f"  Status: {info.get('status')}")
         
     except Exception as e:
         if verbose:
             print(f"  ERROR: {e}")
             import traceback
             traceback.print_exc()
-        # Return a failed result
+        # Return a failed result - need to compute V_initial ourselves
+        optimizer = NashWelfareOptimizer(n_agents, n_resources, utilities, supply)
+        initial_result = optimizer.solve(verbose=False)
+        x_initial = initial_result.allocation
+        V_initial = np.array([np.dot(x_initial[i], utilities[i]) for i in range(n_agents)])
+        
         elapsed = time.perf_counter() - start_time
         return SimulationResult(
             attacker_size=attacker_size,
@@ -167,10 +177,14 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
             q_nee_individual={},
             V_initial=V_initial,
             V_final=np.full(n_agents, np.nan),
+            nash_welfare_initial=float(np.prod(V_initial)),
+            nash_welfare_final=float('nan'),
         )
     
-    # Compute final utilities
-    V_final = np.array([np.dot(x_final[i], utilities[i]) for i in range(n_agents)])
+    # V_initial and V_final are already numpy arrays from info dict
+    # Convert if needed
+    V_initial = np.array(V_initial)
+    V_final = np.array(V_final)
     
     if verbose:
         print(f"  Final utilities: {V_final.round(4)}")
@@ -201,12 +215,18 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
     # Compute group q-NEE for all non-attackers
     q_nee_non_attackers = geometric_mean(list(q_nee_individual.values()))
     
+    # Compute Nash welfare (product of utilities)
+    nash_welfare_initial = float(np.prod(V_initial))
+    nash_welfare_final = float(np.prod(V_final))
+    
     elapsed = time.perf_counter() - start_time
     
     if verbose:
         print(f"  p-MON attacking group: {p_mon_attacking_group:.6f}")
         print(f"  q-NEE defending group: {q_nee_defending_group:.6f}")
         print(f"  q-NEE non-attackers: {q_nee_non_attackers:.6f}")
+        print(f"  Nash welfare initial: {nash_welfare_initial:.6e}")
+        print(f"  Nash welfare final: {nash_welfare_final:.6e}")
         print(f"  Time: {elapsed:.2f}s")
     
     return SimulationResult(
@@ -226,6 +246,8 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         q_nee_individual=q_nee_individual,
         V_initial=V_initial,
         V_final=V_final,
+        nash_welfare_initial=nash_welfare_initial,
+        nash_welfare_final=nash_welfare_final,
     )
 
 
@@ -243,10 +265,20 @@ def results_to_rows(results: List[SimulationResult], n_agents: int = 10) -> List
             'converged': r.converged,
             'time_seconds': r.time_seconds,
             'n_iterations': r.n_iterations,
+            'nash_welfare_initial': r.nash_welfare_initial,
+            'nash_welfare_final': r.nash_welfare_final,
             'p_mon_attacking_group': r.p_mon_attacking_group,
             'q_nee_defending_group': r.q_nee_defending_group,
             'q_nee_non_attackers': r.q_nee_non_attackers,
         }
+        
+        # Add individual V_initial values
+        for i in range(n_agents):
+            row[f'V_initial_{i}'] = r.V_initial[i] if i < len(r.V_initial) else float('nan')
+        
+        # Add individual V_final values
+        for i in range(n_agents):
+            row[f'V_final_{i}'] = r.V_final[i] if i < len(r.V_final) else float('nan')
         
         # Add individual p-MON values (attackers only)
         for i in range(n_agents):
@@ -342,6 +374,8 @@ def main():
                         help="Save results every N simulations (default: 6)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Print verbose output for each simulation")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print detailed debug output (implies verbose)")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                         help="Just print configurations without running")
     
@@ -414,9 +448,10 @@ def main():
             defender_size=def_size,
             n_resources=n_resources,
             seed=seed,
-            verbose=args.verbose,
+            verbose=args.verbose or args.debug,
             use_projection=use_projection,
             use_integral_method=use_integral_method,
+            debug=args.debug,
         )
         
         results.append(result)
@@ -456,5 +491,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-V_initial and V_final are not logged to the output so idk those values. the total utility before and after would be a good thing to add to the simulation log. the p-MON constraint should be benifitting the attackers because it is finding the constraint that maximized their utility. the weird part is that every elses utility is going up after. To me this seems like it may be a bug in accessing the before allocation or after allocation correctly so lets start by accessing those.

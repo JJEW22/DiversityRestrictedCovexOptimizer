@@ -14,7 +14,7 @@ solvers.options['show_progress'] = False
 # =============================================================================
 
 # Threshold for considering an allocation as "meaningful" (not numerical noise)
-ALLOCATION_THRESHOLD = 1e-6
+ALLOCATION_THRESHOLD = 1e-3
 
 # Tolerance for considering ratios as "tied"
 TIE_TOLERANCE = 1e-4
@@ -655,7 +655,7 @@ class NashWelfareOptimizer:
         self.n_resources = n_resources
         self.n_vars = n_agents * n_resources
         self.utilities = np.array(utilities)
-        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
+        self.supply = supply if supply is not None else np.ones(n_resources)
         self.agent_constraints: Dict[int, Optional[AgentDiversityConstraint]] = {
             i: None for i in range(n_agents)
         }
@@ -710,12 +710,15 @@ class NashWelfareOptimizer:
     def _build_base_constraints(self) -> Tuple[np.ndarray, np.ndarray]:
         G_list, h_list = [], []
         
+        # x >= 0
         G_list.append(-np.eye(self.n_vars))
         h_list.append(np.zeros(self.n_vars))
         
+        # x <= supply (per resource, per agent)
         G_list.append(np.eye(self.n_vars))
-        h_list.append(np.ones(self.n_vars))
+        h_list.append(np.tile(self.supply, self.n_agents))
         
+        # sum_i x_ij <= supply[j] for each resource j
         for j in range(self.n_resources):
             row = np.zeros(self.n_vars)
             for i in range(self.n_agents):
@@ -937,7 +940,7 @@ class DirectionalDerivativeOracle:
         self.utilities = utilities
         self.attacking_group = attacking_group
         self.non_attacking_group = set(range(n_agents)) - attacking_group
-        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
+        self.supply = supply if supply is not None else np.ones(n_resources)
         self.verbose = verbose
         self.n_free_vars = n_agents * n_resources
         self.use_integral_method = use_integral_method
@@ -2023,7 +2026,7 @@ class SwapOptimalityOracle:
         self.utilities = utilities
         self.attacking_group = attacking_group
         self.non_attacking_group = set(range(n_agents)) - attacking_group
-        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
+        self.supply = supply if supply is not None else np.ones(n_resources)
         self.verbose = verbose
         self.n_free_vars = n_agents * n_resources
         
@@ -2187,7 +2190,7 @@ class OptimalBoundaryOracle:
         self.utilities = utilities
         self.attacking_group = attacking_group
         self.non_attacking_group = set(range(n_agents)) - attacking_group
-        self.supply = supply if supply is not None else np.ones(n_resources) * n_agents
+        self.supply = supply if supply is not None else np.ones(n_resources)
         self.verbose = verbose
         self.n_free_vars = n_agents * n_resources
         
@@ -2302,7 +2305,7 @@ def _solve_optimal_constraint_convex_program(
     maximize_harm: bool = False,
     verbose: bool = False,
     debug: bool = False,
-    use_projection: bool = True,
+    use_projection: bool = False,
     use_two_phase: bool = True,
     track_timing: bool = False,
     use_integral_method: bool = False
@@ -2346,7 +2349,7 @@ def _solve_optimal_constraint_convex_program(
         verbose = True
     
     n_agents, n_resources = utilities.shape
-    supply = supply if supply is not None else np.ones(n_resources) * n_agents
+    supply = supply if supply is not None else np.ones(n_resources)
     
     if verbose:
         print(f"  [ConvexProgram] n_agents={n_agents}, n_resources={n_resources}")
@@ -3530,7 +3533,9 @@ def compute_optimal_self_benefit_constraint(
     initial_constraints: Optional[Dict[int, AgentDiversityConstraint]] = None,
     verbose: bool = False,
     timing: bool = False,
-    debug: bool = False
+    debug: bool = False,
+    use_projection: bool = False,
+    use_integral_method: bool = False
 ) -> Tuple[Optional[Dict[int, ProportionalityConstraint]], Dict]:
     """
     Compute the diversity constraints that maximize benefit for the attacking group.
@@ -3564,6 +3569,8 @@ def compute_optimal_self_benefit_constraint(
         verbose: If True, print optimization progress.
         timing: If True, include timing information in the returned info dict.
         debug: If True, include additional debug information and enable verbose.
+        use_projection: If True, use projection-based optimization (default True).
+        use_integral_method: If True, use integral-based boundary finding instead of binary search (default False).
     
     Returns:
         Tuple of:
@@ -3628,7 +3635,7 @@ def compute_optimal_self_benefit_constraint(
         verbose = True
     
     n_agents, n_resources = utilities.shape
-    supply = supply if supply is not None else np.ones(n_resources) * n_agents
+    supply = supply if supply is not None else np.ones(n_resources)
     initial_constraints = initial_constraints or {}
     
     # Default victim group: all non-attackers
@@ -3653,24 +3660,34 @@ def compute_optimal_self_benefit_constraint(
     if timing:
         timing_info['initial_solve_time'] = time.time() - t_start
     
-    # Check if initial allocation is on optimal boundary
-    boundary_oracle = OptimalBoundaryOracle(n_agents, n_resources, utilities, attacking_group, supply, verbose=debug)
+    # Create the same oracles used in _solve_optimal_constraint_convex_program for consistency
+    swap_oracle = SwapOptimalityOracle(n_agents, n_resources, utilities, attacking_group, supply, verbose=debug)
+    dir_deriv_oracle = DirectionalDerivativeOracle(n_agents, n_resources, utilities, attacking_group, supply, verbose=debug, use_integral_method=use_integral_method)
     
     # Convert initial allocation to free variables format (all agents now)
     initial_x_free = initial_allocation.flatten()
     
-    initial_boundary_violated, _, _ = boundary_oracle.is_violated(initial_x_free)
-    initial_on_boundary = not initial_boundary_violated
+    # Check both oracles on initial allocation
+    initial_swap_violated, _, _ = swap_oracle.is_violated(initial_x_free)
+    initial_dir_violated, _, _ = dir_deriv_oracle.is_violated(initial_x_free)
+    initial_on_boundary = not initial_swap_violated and not initial_dir_violated
     
-    # Compute directional derivative
-    x_full = boundary_oracle._get_full_allocation(initial_x_free)
-    V = boundary_oracle._compute_utilities_from_allocation(x_full)
-    initial_directional_deriv = boundary_oracle._compute_directional_derivative(x_full, V)
+    # Compute utilities and directional derivative
+    x_full = initial_x_free.reshape((n_agents, n_resources))
+    V = np.array([np.dot(utilities[i], x_full[i]) for i in range(n_agents)])
+    
+    # Compute directional derivative using dir_deriv_oracle's method
+    forward_direction, forward_valid = dir_deriv_oracle._compute_direction(x_full, V, backward=False)
+    if forward_valid:
+        initial_directional_deriv = dir_deriv_oracle._compute_directional_derivative_with_direction(x_full, V, forward_direction)
+    else:
+        backward_direction, _ = dir_deriv_oracle._compute_direction(x_full, V, backward=True)
+        backward_deriv = dir_deriv_oracle._compute_directional_derivative_with_direction(x_full, V, backward_direction)
+        initial_directional_deriv = -backward_deriv
     
     if debug:
         print(f"[DEBUG] Initial allocation:\n{initial_allocation.round(4)}")
         print(f"[DEBUG] Initial utilities: {initial_utilities.round(6)}")
-        print(f"[DEBUG] Reconstructed allocation matches: {np.allclose(x_full, initial_allocation)}")
         print(f"[DEBUG] Reconstructed utilities: {V.round(6)}")
         
         # Show v_{i,j}/V_i for each agent to check KKT conditions
@@ -3679,6 +3696,8 @@ def compute_optimal_self_benefit_constraint(
             ratios = utilities[i] / V[i]
             print(f"[DEBUG]   Agent {i}: {ratios.round(6)}")
         
+        print(f"[DEBUG] Initial swap violated: {initial_swap_violated}")
+        print(f"[DEBUG] Initial dir_deriv violated: {initial_dir_violated}")
         print(f"[DEBUG] Initial on optimal boundary: {initial_on_boundary}")
         print(f"[DEBUG] Initial directional derivative: {initial_directional_deriv:.6e}")
     
@@ -3692,7 +3711,9 @@ def compute_optimal_self_benefit_constraint(
         initial_constraints=initial_constraints,
         maximize_harm=False,  # Maximize utility (minimize p-MON)
         verbose=verbose,
-        debug=debug
+        debug=debug,
+        use_projection=use_projection,
+        use_integral_method=use_integral_method
     )
     if timing:
         timing_info['optimization_time'] = time.time() - t_start
@@ -3725,16 +3746,29 @@ def compute_optimal_self_benefit_constraint(
                     print(f"[DEBUG] Created ProportionalityConstraint for agent {agent_id}")
                     print(f"[DEBUG]   ratios: {optimal_constraints[agent_id].get_ratios().round(6)}")
     
-    # Compute directional derivative for convex program allocation
+    # Check oracles on convex program allocation
     cp_x_free = convex_program_allocation.flatten()
     
-    cp_x_full = boundary_oracle._get_full_allocation(cp_x_free)
-    cp_V = boundary_oracle._compute_utilities_from_allocation(cp_x_full)
-    cp_directional_deriv = boundary_oracle._compute_directional_derivative(cp_x_full, cp_V)
-    cp_on_boundary, _, _ = boundary_oracle.is_violated(cp_x_free)
-    cp_on_boundary = not cp_on_boundary
+    cp_x_full = cp_x_free.reshape((n_agents, n_resources))
+    cp_V = np.array([np.dot(utilities[i], cp_x_full[i]) for i in range(n_agents)])
+    
+    # Compute directional derivative
+    cp_forward_direction, cp_forward_valid = dir_deriv_oracle._compute_direction(cp_x_full, cp_V, backward=False)
+    if cp_forward_valid:
+        cp_directional_deriv = dir_deriv_oracle._compute_directional_derivative_with_direction(cp_x_full, cp_V, cp_forward_direction)
+    else:
+        cp_backward_direction, _ = dir_deriv_oracle._compute_direction(cp_x_full, cp_V, backward=True)
+        cp_backward_deriv = dir_deriv_oracle._compute_directional_derivative_with_direction(cp_x_full, cp_V, cp_backward_direction)
+        cp_directional_deriv = -cp_backward_deriv
+    
+    # Check both oracles
+    cp_swap_violated, _, _ = swap_oracle.is_violated(cp_x_free)
+    cp_dir_violated, _, _ = dir_deriv_oracle.is_violated(cp_x_free)
+    cp_on_boundary = not cp_swap_violated and not cp_dir_violated
     
     if debug:
+        print(f"[DEBUG] Convex program swap violated: {cp_swap_violated}")
+        print(f"[DEBUG] Convex program dir_deriv violated: {cp_dir_violated}")
         print(f"[DEBUG] Convex program directional derivative: {cp_directional_deriv:.6e}")
         print(f"[DEBUG] Convex program on optimal boundary: {cp_on_boundary}")
     
@@ -3743,28 +3777,105 @@ def compute_optimal_self_benefit_constraint(
     if optimal_constraints:
         if debug:
             print(f"[DEBUG] Solving final Nash welfare with {len(optimal_constraints)} constraints")
+            print(f"[DEBUG] Optimal directions from convex program:")
+            for agent_id, direction in optimal_directions.items():
+                print(f"[DEBUG]   Agent {agent_id}: {direction}")
+            print(f"[DEBUG] Convex program allocation for attackers:")
+            for agent_id in attacking_group:
+                print(f"[DEBUG]   Agent {agent_id}: {convex_program_allocation[agent_id]}")
+        
         final_optimizer = NashWelfareOptimizer(n_agents, n_resources, utilities, supply)
         for agent_id, constraint in initial_constraints.items():
             final_optimizer.set_agent_constraint(agent_id, constraint)
         for agent_id, constraint in optimal_constraints.items():
             final_optimizer.add_agent_constraint(agent_id, constraint)
+            if debug:
+                print(f"[DEBUG] Added constraint for agent {agent_id}, ratios: {constraint.get_ratios()}")
+        
         final_result = final_optimizer.solve(verbose=verbose)
         final_utilities = final_result.agent_utilities
         final_allocation = final_result.allocation
         
-        # Compute directional derivative for final allocation
+        if debug:
+            print(f"[DEBUG] Final allocation for attackers:")
+            for agent_id in attacking_group:
+                print(f"[DEBUG]   Agent {agent_id}: {final_allocation[agent_id]}")
+                # Check if final allocation satisfies the constraint
+                constraint = optimal_constraints[agent_id]
+                violated, _, _ = constraint.is_violated(final_allocation[agent_id])
+                print(f"[DEBUG]   Constraint violated: {violated}")
+        
+        # Check oracles on final allocation
         final_x_free = final_allocation.flatten()
         
-        final_x_full = boundary_oracle._get_full_allocation(final_x_free)
-        final_V = boundary_oracle._compute_utilities_from_allocation(final_x_full)
-        final_directional_deriv = boundary_oracle._compute_directional_derivative(final_x_full, final_V)
-        final_on_boundary, _, _ = boundary_oracle.is_violated(final_x_free)
-        final_on_boundary = not final_on_boundary
+        final_x_full = final_x_free.reshape((n_agents, n_resources))
+        final_V = np.array([np.dot(utilities[i], final_x_full[i]) for i in range(n_agents)])
+        
+        # Compute directional derivative
+        final_forward_direction, final_forward_valid = dir_deriv_oracle._compute_direction(final_x_full, final_V, backward=False)
+        if final_forward_valid:
+            final_directional_deriv = dir_deriv_oracle._compute_directional_derivative_with_direction(final_x_full, final_V, final_forward_direction)
+        else:
+            final_backward_direction, _ = dir_deriv_oracle._compute_direction(final_x_full, final_V, backward=True)
+            final_backward_deriv = dir_deriv_oracle._compute_directional_derivative_with_direction(final_x_full, final_V, final_backward_direction)
+            final_directional_deriv = -final_backward_deriv
+        
+        # Check both oracles
+        final_swap_violated, _, _ = swap_oracle.is_violated(final_x_free)
+        final_dir_violated, _, _ = dir_deriv_oracle.is_violated(final_x_free)
+        final_on_boundary = not final_swap_violated and not final_dir_violated
+        
+        # Check if final allocation matches convex program allocation
+        allocation_diff_norm = np.linalg.norm(final_allocation - convex_program_allocation)
+        utility_diff_norm = np.linalg.norm(final_utilities - convex_program_utilities)
+        allocations_match = allocation_diff_norm < 1e-4
+        
+        if not allocations_match:
+            print(f"[WARNING] Final allocation differs from convex program allocation!")
+            print(f"[WARNING]   Allocation difference norm: {allocation_diff_norm:.6e}")
+            print(f"[WARNING]   Utility difference norm: {utility_diff_norm:.6e}")
+            print(f"[WARNING]   CP utilities: {convex_program_utilities.round(6)}")
+            print(f"[WARNING]   Final utilities: {final_utilities.round(6)}")
+            print(f"[WARNING]   CP directional derivative: {cp_directional_deriv:.6e} (should be ~0)")
+            print(f"[WARNING]   Final directional derivative: {final_directional_deriv:.6e} (should be ~0)")
+            print(f"[WARNING]   CP swap violated: {cp_swap_violated}, CP dir_deriv violated: {cp_dir_violated}")
+            print(f"[WARNING]   Final swap violated: {final_swap_violated}, Final dir_deriv violated: {final_dir_violated}")
+            print(f"[WARNING]   Attacker allocations:")
+            for agent_id in attacking_group:
+                cp_alloc = convex_program_allocation[agent_id]
+                final_alloc = final_allocation[agent_id]
+                print(f"[WARNING]     Agent {agent_id} CP:    {cp_alloc.round(6)}")
+                print(f"[WARNING]     Agent {agent_id} Final: {final_alloc.round(6)}")
+                
+                # Check if they are scalar multiples of each other
+                cp_norm = np.linalg.norm(cp_alloc)
+                final_norm = np.linalg.norm(final_alloc)
+                if cp_norm > 1e-10 and final_norm > 1e-10:
+                    # Normalize both vectors
+                    cp_normalized = cp_alloc / cp_norm
+                    final_normalized = final_alloc / final_norm
+                    # Check if normalized vectors are the same (or opposite)
+                    dot_product = np.dot(cp_normalized, final_normalized)
+                    if abs(abs(dot_product) - 1.0) < 1e-6:
+                        # They are scalar multiples
+                        scalar_ratio = final_norm / cp_norm
+                        print(f"[WARNING]     Agent {agent_id} ARE scalar multiples! Ratio (Final/CP): {scalar_ratio:.6f}")
+                    else:
+                        # They are not scalar multiples - compute angle
+                        angle_rad = np.arccos(np.clip(dot_product, -1.0, 1.0))
+                        angle_deg = np.degrees(angle_rad)
+                        print(f"[WARNING]     Agent {agent_id} NOT scalar multiples. Angle between: {angle_deg:.2f} degrees")
+                elif cp_norm < 1e-10 and final_norm < 1e-10:
+                    print(f"[WARNING]     Agent {agent_id} Both are zero vectors")
+                else:
+                    print(f"[WARNING]     Agent {agent_id} One is zero, other is not (CP norm: {cp_norm:.6e}, Final norm: {final_norm:.6e})")
         
         if debug:
             print(f"[DEBUG] Final allocation (after re-solving with constraints):\n{final_allocation.round(6)}")
             print(f"[DEBUG] Final utilities: {final_utilities.round(6)}")
             print(f"[DEBUG] Final Nash welfare: {final_result.nash_welfare:.6f}")
+            print(f"[DEBUG] Final swap violated: {final_swap_violated}")
+            print(f"[DEBUG] Final dir_deriv violated: {final_dir_violated}")
             print(f"[DEBUG] Final directional derivative: {final_directional_deriv:.6e}")
             print(f"[DEBUG] Final on optimal boundary: {final_on_boundary}")
             # Compare convex program vs final allocation
@@ -3773,7 +3884,8 @@ def compute_optimal_self_benefit_constraint(
                 cp_util = convex_program_utilities[agent_id]
                 final_util = final_utilities[agent_id]
                 print(f"[DEBUG] Agent {agent_id}: CP utility={cp_util:.6f}, Final utility={final_util:.6f}, diff={final_util - cp_util:.6f}")
-            print(f"[DEBUG] Allocation difference norm: {np.linalg.norm(final_allocation - convex_program_allocation):.6e}")
+            print(f"[DEBUG] Allocation difference norm: {allocation_diff_norm:.6e}")
+            print(f"[DEBUG] Allocations match (within 1e-4): {allocations_match}")
             print(f"[DEBUG] Directional deriv: CP={cp_directional_deriv:.6e}, Final={final_directional_deriv:.6e}")
     else:
         if debug:
@@ -3979,7 +4091,7 @@ def compute_optimal_harm_constraint(
         verbose = True
     
     n_agents, n_resources = utilities.shape
-    supply = supply if supply is not None else np.ones(n_resources) * n_agents
+    supply = supply if supply is not None else np.ones(n_resources)
     initial_constraints = initial_constraints or {}
     
     if debug:
@@ -4152,6 +4264,659 @@ def compute_optimal_harm_constraint(
     }
     
     return optimal_constraints, info
+
+
+def _solve_nash_welfare_for_subset(
+    utilities: np.ndarray,
+    agent_subset: Set[int],
+    available_supply: np.ndarray,
+    n_agents: int,
+    n_resources: int
+) -> Dict[int, np.ndarray]:
+    """
+    Solve Nash welfare maximization for a subset of agents given available supply.
+    
+    Args:
+        utilities: Full utility matrix (n_agents, n_resources)
+        agent_subset: Set of agent indices to optimize for
+        available_supply: Supply available for this subset
+        n_agents: Total number of agents
+        n_resources: Number of resources
+        
+    Returns:
+        Dict mapping agent_id -> allocation array for all agents
+        (agents not in subset get zero allocation)
+    """
+    from cvxopt import matrix, solvers
+    solvers.options['show_progress'] = False
+    
+    subset_list = sorted(agent_subset)
+    n_subset = len(subset_list)
+    
+    if n_subset == 0:
+        return {i: np.zeros(n_resources) for i in range(n_agents)}
+    
+    if np.all(available_supply < 1e-10):
+        return {i: np.zeros(n_resources) for i in range(n_agents)}
+    
+    n_vars = n_subset * n_resources
+    
+    def var_idx(local_i, j):
+        return local_i * n_resources + j
+    
+    def F(x=None, z=None):
+        if x is None:
+            # Initial point: equal division of available supply
+            x0 = matrix(0.0, (n_vars, 1))
+            for local_i, agent in enumerate(subset_list):
+                for j in range(n_resources):
+                    x0[var_idx(local_i, j)] = available_supply[j] / n_subset
+            return (0, x0)
+        
+        # Compute utilities
+        V = []
+        for local_i, agent in enumerate(subset_list):
+            v_i = 0.0
+            for j in range(n_resources):
+                v_i += utilities[agent, j] * x[var_idx(local_i, j)]
+            V.append(max(v_i, 1e-12))
+        
+        # Objective: -sum of log utilities (minimize negative = maximize)
+        f = sum(-np.log(v) for v in V)
+        
+        # Gradient
+        Df = matrix(0.0, (1, n_vars))
+        for local_i, agent in enumerate(subset_list):
+            for j in range(n_resources):
+                Df[var_idx(local_i, j)] = -utilities[agent, j] / V[local_i]
+        
+        if z is None:
+            return (f, Df)
+        
+        # Hessian
+        H = matrix(0.0, (n_vars, n_vars))
+        for local_i, agent in enumerate(subset_list):
+            for j1 in range(n_resources):
+                for j2 in range(n_resources):
+                    idx1 = var_idx(local_i, j1)
+                    idx2 = var_idx(local_i, j2)
+                    H[idx1, idx2] = z[0] * utilities[agent, j1] * utilities[agent, j2] / (V[local_i] ** 2)
+        
+        return (f, Df, H)
+    
+    # Inequality constraints: x >= 0
+    G = matrix(-np.eye(n_vars))
+    h = matrix(np.zeros(n_vars))
+    
+    # Equality constraints: sum over agents for each resource = available_supply
+    A = matrix(0.0, (n_resources, n_vars))
+    b = matrix(available_supply)
+    for j in range(n_resources):
+        for local_i in range(n_subset):
+            A[j, var_idx(local_i, j)] = 1.0
+    
+    try:
+        sol = solvers.cp(F, G, h, A=A, b=b)
+        
+        if sol['status'] != 'optimal':
+            # Return equal division as fallback
+            result = {}
+            for i in range(n_agents):
+                if i in agent_subset:
+                    result[i] = available_supply / n_subset
+                else:
+                    result[i] = np.zeros(n_resources)
+            return result
+        
+        x_sol = np.array(sol['x']).flatten()
+        
+        result = {}
+        for i in range(n_agents):
+            if i in agent_subset:
+                local_i = subset_list.index(i)
+                alloc = np.zeros(n_resources)
+                for j in range(n_resources):
+                    alloc[j] = max(0, x_sol[var_idx(local_i, j)])
+                result[i] = alloc
+            else:
+                result[i] = np.zeros(n_resources)
+        
+        return result
+        
+    except Exception as e:
+        # Return equal division as fallback
+        result = {}
+        for i in range(n_agents):
+            if i in agent_subset:
+                result[i] = available_supply / n_subset
+            else:
+                result[i] = np.zeros(n_resources)
+        return result
+
+
+def solve_optimal_harm_constraint_pgd(
+    utilities: np.ndarray,
+    attacking_group: Set[int],
+    defending_group: Set[int],
+    supply: Optional[np.ndarray] = None,
+    initial_constraints: Optional[Dict[int, AgentDiversityConstraint]] = None,
+    max_iterations: int = 100,
+    step_size: float = 0.1,
+    convergence_tol: float = 1e-6,
+    use_adam: bool = True,
+    verbose: bool = False,
+    debug: bool = False,
+) -> Tuple[Optional[Dict[int, ProportionalityConstraint]], Dict]:
+    """
+    Find the optimal harm constraint using projected gradient descent.
+    
+    This finds the attacker allocation (and thus proportionality constraint) that
+    minimizes the Nash welfare of the defending group (product of defender utilities)
+    while staying on the optimal boundary.
+    
+    The algorithm:
+    1. Start from the unconstrained Nash welfare solution
+    2. Compute gradient of defender Nash welfare w.r.t. attacker allocation
+    3. Take a step in the negative gradient direction (to minimize)
+    4. Project back onto the optimal boundary using DirectionalDerivativeOracle
+    5. Repeat until convergence
+    
+    Args:
+        utilities: Preference matrix of shape (n_agents, n_resources)
+        attacking_group: Set of agent indices who will issue the constraints
+        defending_group: Set of agent indices whose harm we want to maximize
+                        (must be a subset of non-attackers)
+        supply: Optional resource supply vector. Defaults to n_agents per resource.
+        initial_constraints: Optional dict of pre-existing constraints
+        max_iterations: Maximum number of gradient descent iterations
+        step_size: Initial step size for gradient descent
+        convergence_tol: Stop when objective improvement is below this threshold
+        use_adam: If True, use Adam optimizer; if False, use vanilla gradient descent
+        verbose: If True, print progress
+        debug: If True, print detailed debug information
+    
+    Returns:
+        Tuple of:
+        - constraints: Dict mapping agent_id -> ProportionalityConstraint, or None
+        - info: Dict with optimization details including:
+            - 'converged': True if converged by objective improvement
+            - 'iterations': Number of iterations performed
+            - 'initial_defender_welfare': Product of defender utilities at start
+            - 'final_defender_welfare': Product of defender utilities at end
+            - 'initial_allocation': Starting allocation
+            - 'final_allocation': Final allocation on boundary
+            - 'objective_history': List of objective values per iteration
+    """
+    import time
+    
+    if debug:
+        verbose = True
+    
+    n_agents, n_resources = utilities.shape
+    supply = supply if supply is not None else np.ones(n_resources)
+    initial_constraints = initial_constraints or {}
+    non_attacking_group = set(range(n_agents)) - attacking_group
+    
+    # Validate defending_group is subset of non-attackers
+    if not defending_group.issubset(non_attacking_group):
+        raise ValueError(
+            f"defending_group must be subset of non-attackers. "
+            f"defending_group={defending_group}, non_attackers={non_attacking_group}"
+        )
+    
+    if verbose:
+        print(f"[PGD] Starting projected gradient descent for optimal harm constraint")
+        print(f"[PGD] n_agents={n_agents}, n_resources={n_resources}")
+        print(f"[PGD] attacking_group={attacking_group}")
+        print(f"[PGD] defending_group={defending_group}")
+        print(f"[PGD] max_iterations={max_iterations}, step_size={step_size}")
+    
+    # Create oracles
+    dir_deriv_oracle = DirectionalDerivativeOracle(
+        n_agents, n_resources, utilities, attacking_group, supply, verbose=debug
+    )
+    swap_oracle = SwapOptimalityOracle(
+        n_agents, n_resources, utilities, attacking_group, supply, verbose=debug
+    )
+    
+    # Step 1: Get initial allocation from unconstrained Nash welfare
+    optimizer = NashWelfareOptimizer(n_agents, n_resources, utilities, supply)
+    for agent_id, constraint in initial_constraints.items():
+        optimizer.set_agent_constraint(agent_id, constraint)
+    
+    initial_result = optimizer.solve(verbose=False)
+    x_current = initial_result.allocation.copy()
+    
+    if verbose:
+        print(f"[PGD] Initial Nash welfare: {initial_result.nash_welfare:.6f}")
+    
+    # Compute initial defender welfare
+    def compute_defender_welfare(x: np.ndarray) -> float:
+        """Compute product of defender utilities (Nash welfare of defenders)."""
+        V = np.array([np.dot(utilities[i], x[i]) for i in range(n_agents)])
+        welfare = 1.0
+        for d in defending_group:
+            welfare *= max(V[d], 1e-20)
+        return welfare
+    
+    def compute_utilities_arr(x: np.ndarray) -> np.ndarray:
+        """Compute utilities for all agents."""
+        return np.array([np.dot(utilities[i], x[i]) for i in range(n_agents)])
+    
+    initial_defender_welfare = compute_defender_welfare(x_current)
+    initial_allocation = x_current.copy()
+    
+    if verbose:
+        print(f"[PGD] Initial defender welfare: {initial_defender_welfare:.6e}")
+    
+    # Adam optimizer state (initialized for attacker-sized arrays)
+    if use_adam:
+        beta1, beta2, epsilon = 0.9, 0.999, 1e-8
+        m_atk = np.zeros((len(attacking_group), n_resources))
+        v_atk = np.zeros((len(attacking_group), n_resources))
+    
+    # Tracking
+    objective_history = [initial_defender_welfare]
+    converged = False
+    final_iteration = 0
+    
+    # Non-defenders = everyone except defenders (includes attackers)
+    non_defending_group = set(range(n_agents)) - defending_group
+    attacker_list = sorted(attacking_group)
+    
+    for iteration in range(max_iterations):
+        final_iteration = iteration + 1
+        
+        # Compute utilities at current point
+        V = compute_utilities_arr(x_current)
+        
+        # Compute ratio matrix v_{i,j} / V_i for all agents
+        ratios = np.zeros((n_agents, n_resources))
+        for i in range(n_agents):
+            for j in range(n_resources):
+                ratios[i, j] = utilities[i, j] / max(V[i], 1e-10)
+        
+        # Compute gradient of defender Nash welfare w.r.t. attacker allocation
+        # ∇_{a,j} = -|t_j ∩ D| / |t_j| * r_j
+        # where:
+        #   t_j = set of non-attackers tied at minimum ratio v_{i,j}/V_i for resource j
+        #   D = defending_group
+        #   r_j = the minimum ratio value
+        
+        attacker_gradient = np.zeros((len(attacking_group), n_resources))
+        
+        for j in range(n_resources):
+            # Use the existing function to find tied agents at minimum ratio
+            t_j_list, r_j = find_dependent_agents_for_resource(
+                j, x_current, ratios, non_attacking_group, find_min=True
+            )
+            t_j = set(t_j_list)
+            
+            if debug and j < 3:  # Debug first few resources
+                print(f"[PGD]   Resource {j}: t_j={t_j}, r_j={r_j:.6f}")
+            
+            if not t_j:
+                # No non-attackers have meaningful allocation for this resource
+                continue
+            
+            # Count |t_j ∩ D| = how many tied agents are defenders
+            t_j_intersect_D = t_j & defending_group
+            n_tied_defenders = len(t_j_intersect_D)
+            n_tied_total = len(t_j)
+            
+            if debug and j < 3:
+                print(f"[PGD]   Resource {j}: t_j∩D={t_j_intersect_D}, |t_j∩D|={n_tied_defenders}, |t_j|={n_tied_total}")
+            
+            if n_tied_defenders == 0:
+                # No defenders are tied at minimum - gradient is 0 for this resource
+                continue
+            
+            # Compute gradient: ∇_{a,j} = -|t_j ∩ D| / |t_j| * r_j
+            # This is the same for ALL attackers (gradient doesn't depend on which attacker)
+            grad_j = -(n_tied_defenders / n_tied_total) * r_j
+            
+            for idx, a in enumerate(attacker_list):
+                attacker_gradient[idx, j] = grad_j
+        
+        if debug:
+            print(f"[PGD] Iteration {iteration}:")
+            print(f"[PGD]   Defender welfare: {objective_history[-1]:.6e}")
+            print(f"[PGD]   Attacker gradient (∇_{a,j} = -|t_j∩D|/|t_j| * r_j):")
+            for idx, a in enumerate(attacker_list):
+                print(f"[PGD]     Agent {a}: {attacker_gradient[idx].round(6)}")
+        
+        # Check if any attacker has non-zero gradient
+        attacker_has_nonzero_gradient = np.any(np.abs(attacker_gradient) > 1e-10)
+        
+        if not attacker_has_nonzero_gradient:
+            if verbose:
+                print(f"[PGD] Iteration {iteration}: Gradient is zero for all attackers - no defenders tied at minimum ratio")
+        
+        # Apply optimizer update to attacker allocations only
+        if use_adam:
+            m_atk = beta1 * m_atk + (1 - beta1) * attacker_gradient
+            v_atk = beta2 * v_atk + (1 - beta2) * (attacker_gradient ** 2)
+            m_hat = m_atk / (1 - beta1 ** (iteration + 1))
+            v_hat = v_atk / (1 - beta2 ** (iteration + 1))
+            update = step_size * m_hat / (np.sqrt(v_hat) + epsilon)
+        else:
+            update = step_size * attacker_gradient
+        
+        # Step 3: Update attacker allocations
+        # Gradient descent: x_new = x_old - step * gradient (to minimize)
+        # Since gradient is negative (e.g., -0.9), subtracting it increases attacker allocation
+        x_attacker_new = np.zeros((len(attacking_group), n_resources))
+        for idx, a in enumerate(attacker_list):
+            x_attacker_new[idx] = x_current[a] - update[idx]  # SUBTRACT for gradient descent
+            # Ensure non-negative
+            x_attacker_new[idx] = np.maximum(x_attacker_new[idx], 0)
+            # Ensure doesn't exceed supply
+            x_attacker_new[idx] = np.minimum(x_attacker_new[idx], supply)
+        
+        if debug:
+            print(f"[PGD]   New attacker allocations:")
+            for idx, a in enumerate(attacker_list):
+                print(f"[PGD]     Agent {a}: {x_attacker_new[idx].round(6)}")
+        
+        # Step 4: Recompute non-attacker allocations given new attacker allocations
+        # Remaining supply after attackers
+        attacker_total = np.sum(x_attacker_new, axis=0)
+        remaining_supply = supply - attacker_total
+        remaining_supply = np.maximum(remaining_supply, 0)
+        
+        if debug:
+            print(f"[PGD]   Remaining supply for non-attackers: {remaining_supply.round(6)}")
+        
+        # Solve Nash welfare for non-attackers with remaining supply
+        non_attacker_alloc = _solve_nash_welfare_for_subset(
+            utilities, non_attacking_group, remaining_supply, n_agents, n_resources
+        )
+        
+        # Build full allocation
+        x_new = np.zeros((n_agents, n_resources))
+        for idx, a in enumerate(attacker_list):
+            x_new[a] = x_attacker_new[idx]
+        for i in non_attacking_group:
+            x_new[i] = non_attacker_alloc[i]
+        
+        # Step 5: Project back to boundary using DirectionalDerivativeOracle
+        x_new_flat = x_new.flatten()
+        dir_violated, _, _ = dir_deriv_oracle.is_violated(x_new_flat)
+        
+        if dir_violated:
+            # Oracle found boundary point
+            if dir_deriv_oracle.last_boundary_point is not None:
+                x_projected = dir_deriv_oracle.last_boundary_point.reshape((n_agents, n_resources))
+                if debug:
+                    print(f"[PGD]   Projected back to boundary")
+            else:
+                x_projected = x_new
+                if debug:
+                    print(f"[PGD]   WARNING: Oracle violated but no boundary point returned")
+        else:
+            # Already on boundary
+            x_projected = x_new
+            if debug:
+                print(f"[PGD]   Already on boundary (no projection needed)")
+        
+        # Sanity check: verify swap optimality
+        swap_violated, _, _ = swap_oracle.is_violated(x_projected.flatten())
+        if swap_violated:
+            print(f"[PGD WARNING] Iteration {iteration}: Swap optimality violated after projection!")
+        
+        # Print allocations before computing new defender welfare (only in debug mode)
+        if debug:
+            print(f"[PGD] Iteration {iteration} - Allocations after projection:")
+            for i in range(n_agents):
+                if i in attacking_group:
+                    role = "ATK"
+                elif i in defending_group:
+                    role = "DEF"
+                else:
+                    role = "OTH"
+                print(f"[PGD]   Agent {i} ({role}): {x_projected[i].round(6)}")
+        
+        # Compute new objective (for tracking/debugging)
+        new_defender_welfare = compute_defender_welfare(x_projected)
+        objective_history.append(new_defender_welfare)
+        
+        # Warning if we moved in the wrong direction (welfare increased instead of decreased)
+        # Only warn if the increase is significant (> 0.1% relative increase)
+        improvement = objective_history[-2] - objective_history[-1]
+        relative_increase = -improvement / max(abs(objective_history[-2]), 1e-10)
+        if relative_increase > 1e-3:  # More than 0.1% increase
+            print(f"[PGD WARNING] Iteration {iteration}: Moved in WRONG direction! Defender welfare INCREASED.")
+            print(f"[PGD WARNING]   Previous welfare: {objective_history[-2]:.6e}")
+            print(f"[PGD WARNING]   New welfare: {objective_history[-1]:.6e}")
+            print(f"[PGD WARNING]   Relative increase: {relative_increase:.4f} ({relative_increase*100:.2f}%)")
+        
+        # Check convergence based on defender welfare change (the objective we're minimizing)
+        if len(objective_history) >= 2:
+            prev_welfare = objective_history[-2]
+            curr_welfare = objective_history[-1]
+            welfare_change = abs(curr_welfare - prev_welfare)
+            relative_welfare_change = welfare_change / max(abs(prev_welfare), 1e-10)
+        else:
+            relative_welfare_change = float('inf')
+        
+        if debug:
+            print(f"[PGD]   New defender welfare: {new_defender_welfare:.6e}")
+            print(f"[PGD]   Welfare change: {welfare_change:.6e} (relative: {relative_welfare_change:.6e})")
+        
+        if relative_welfare_change < convergence_tol:
+            converged = True
+            if verbose:
+                print(f"[PGD] Converged at iteration {iteration} (relative welfare change {relative_welfare_change:.6e} < {convergence_tol})")
+            x_current = x_projected
+            break
+        
+        x_current = x_projected
+    
+    if not converged and verbose:
+        print(f"[PGD] Did not converge after {max_iterations} iterations")
+    
+    # Cleanup step: redistribute items that non-attackers don't value
+    # For each non-attacker, if they have allocation of an item they don't value (v_{i,j} = 0),
+    # free that allocation and redistribute via Nash welfare to non-defenders (attackers + neutrals)
+    
+    # Step 1: Identify freed supply from non-attackers holding items they don't value
+    freed_supply = np.zeros(n_resources)
+    locked_utility = {}  # c_i for each non-attacker (utility from items they DO value)
+    
+    # First compute locked utility for all non-attackers
+    for i in non_attacking_group:
+        locked_utility[i] = 0.0
+        for j in range(n_resources):
+            locked_utility[i] += utilities[i, j] * x_current[i, j]
+    
+    # Free allocations from all non-attackers (defenders + neutrals) for items they don't value
+    for i in non_attacking_group:
+        for j in range(n_resources):
+            if utilities[i, j] < 1e-10 and x_current[i, j] > 1e-10:
+                # Non-attacker i has allocation of item j but doesn't value it
+                freed_supply[j] += x_current[i, j]
+                # Update locked utility to exclude this freed allocation
+                locked_utility[i] -= utilities[i, j] * x_current[i, j]  # This is 0 anyway since v_{i,j} = 0
+                x_current[i, j] = 0.0
+    
+    if np.sum(freed_supply) > 1e-10:
+        if verbose:
+            print(f"[PGD] Cleanup: freed supply from unvalued items: {freed_supply.round(6)}")
+        
+        # Solve Nash welfare for non-defenders (attackers + neutrals) with freed supply
+        # Objective: maximize sum_i log(c_i + v_i · x_i) where c_i is locked utility
+        # This is equivalent to Nash welfare with a constant offset
+        
+        # non_defending_group = attackers + neutrals
+        non_defenders = list(non_defending_group)
+        
+        # Compute locked utility for non-defenders
+        for i in non_defending_group:
+            if i not in locked_utility:
+                locked_utility[i] = 0.0
+                for j in range(n_resources):
+                    locked_utility[i] += utilities[i, j] * x_current[i, j]
+        
+        try:
+            from cvxopt import matrix, solvers
+            solvers.options['show_progress'] = False
+            
+            n_non_defenders = len(non_defenders)
+            n_vars = n_non_defenders * n_resources
+            
+            def var_idx(local_i, j):
+                return local_i * n_resources + j
+            
+            def F(x=None, z=None):
+                if x is None:
+                    # Initial point: split freed supply equally
+                    x0 = matrix(0.0, (n_vars, 1))
+                    for local_i, agent in enumerate(non_defenders):
+                        for j in range(n_resources):
+                            if freed_supply[j] > 1e-10:
+                                x0[var_idx(local_i, j)] = freed_supply[j] / n_non_defenders
+                    return (0, x0)
+                
+                # Compute utilities: V_i = c_i + sum_j v_{i,j} * x_{i,j}
+                V = []
+                for local_i, agent in enumerate(non_defenders):
+                    v_i = locked_utility[agent]
+                    for j in range(n_resources):
+                        v_i += utilities[agent, j] * x[var_idx(local_i, j)]
+                    V.append(max(v_i, 1e-12))
+                
+                # Objective: -sum_i log(V_i)
+                f = sum(-np.log(v) for v in V)
+                
+                # Gradient
+                Df = matrix(0.0, (1, n_vars))
+                for local_i, agent in enumerate(non_defenders):
+                    for j in range(n_resources):
+                        Df[var_idx(local_i, j)] = -utilities[agent, j] / V[local_i]
+                
+                if z is None:
+                    return (f, Df)
+                
+                # Hessian
+                H = matrix(0.0, (n_vars, n_vars))
+                for local_i, agent in enumerate(non_defenders):
+                    for j1 in range(n_resources):
+                        for j2 in range(n_resources):
+                            idx1 = var_idx(local_i, j1)
+                            idx2 = var_idx(local_i, j2)
+                            H[idx1, idx2] = z[0] * utilities[agent, j1] * utilities[agent, j2] / (V[local_i] ** 2)
+                
+                return (f, Df, H)
+            
+            # Constraints: x >= 0
+            G = matrix(-np.eye(n_vars))
+            h = matrix(np.zeros(n_vars))
+            
+            # Constraints: sum_i x_{i,j} = freed_supply[j] (equality - use all freed supply)
+            A = matrix(0.0, (n_resources, n_vars))
+            b = matrix(freed_supply)
+            for j in range(n_resources):
+                for local_i in range(n_non_defenders):
+                    A[j, var_idx(local_i, j)] = 1.0
+            
+            sol = solvers.cp(F, G, h, A=A, b=b)
+            
+            if sol['status'] == 'optimal':
+                x_sol = np.array(sol['x']).flatten()
+                
+                # Add the new allocations to x_current
+                for local_i, agent in enumerate(non_defenders):
+                    for j in range(n_resources):
+                        x_current[agent, j] += max(0, x_sol[var_idx(local_i, j)])
+                
+                if verbose:
+                    print(f"[PGD] Cleanup: redistributed freed supply via Nash welfare to non-defenders")
+            else:
+                if verbose:
+                    print(f"[PGD] Cleanup: Nash welfare optimization failed, giving freed supply to highest-ratio non-defenders")
+                # Fallback: give freed supply to non-defender with highest ratio for each resource
+                V_current = compute_utilities_arr(x_current)
+                for j in range(n_resources):
+                    if freed_supply[j] > 1e-10:
+                        best_agent = None
+                        best_ratio = -1
+                        for i in non_defending_group:
+                            ratio = utilities[i, j] / max(V_current[i], 1e-10)
+                            if ratio > best_ratio:
+                                best_ratio = ratio
+                                best_agent = i
+                        if best_agent is not None:
+                            x_current[best_agent, j] += freed_supply[j]
+        
+        except Exception as e:
+            if verbose:
+                print(f"[PGD] Cleanup: optimization failed ({e}), giving freed supply to highest-ratio non-defenders")
+            # Fallback: give freed supply to non-defender with highest ratio for each resource
+            V_current = compute_utilities_arr(x_current)
+            for j in range(n_resources):
+                if freed_supply[j] > 1e-10:
+                    best_agent = None
+                    best_ratio = -1
+                    for i in non_defending_group:
+                        ratio = utilities[i, j] / max(V_current[i], 1e-10)
+                        if ratio > best_ratio:
+                            best_ratio = ratio
+                            best_agent = i
+                    if best_agent is not None:
+                        x_current[best_agent, j] += freed_supply[j]
+    
+    final_defender_welfare = compute_defender_welfare(x_current)
+    final_allocation = x_current.copy()
+    final_utilities = compute_utilities_arr(x_current)
+    
+    if verbose:
+        print(f"[PGD] Final defender welfare: {final_defender_welfare:.6e}")
+        print(f"[PGD] Welfare reduction: {initial_defender_welfare / max(final_defender_welfare, 1e-20):.4f}x")
+    
+    # Create ProportionalityConstraints from final attacker allocation
+    optimal_constraints = {}
+    for a in attacking_group:
+        attacker_alloc = final_allocation[a]
+        if np.linalg.norm(attacker_alloc) > 1e-10:
+            optimal_constraints[a] = ProportionalityConstraint(n_resources, attacker_alloc)
+            if debug:
+                print(f"[PGD] Created constraint for agent {a}: {attacker_alloc.round(6)}")
+    
+    # Compute metrics
+    initial_utilities_arr = compute_utilities_arr(initial_allocation)
+    
+    # q-NEE for defenders
+    q_nee_individual = {}
+    for d in defending_group:
+        if initial_utilities_arr[d] > 1e-10:
+            q_nee_individual[d] = final_utilities[d] / initial_utilities_arr[d]
+        else:
+            q_nee_individual[d] = float('inf') if final_utilities[d] > 1e-10 else 1.0
+    
+    if defending_group:
+        k = len(defending_group)
+        log_sum = sum(np.log(max(q_nee_individual[d], 1e-20)) for d in defending_group)
+        q_nee_group = np.exp(log_sum / k)
+    else:
+        q_nee_group = 1.0
+    
+    info = {
+        'converged': converged,
+        'iterations': final_iteration,
+        'initial_defender_welfare': initial_defender_welfare,
+        'final_defender_welfare': final_defender_welfare,
+        'initial_allocation': initial_allocation,
+        'final_allocation': final_allocation,
+        'initial_utilities': initial_utilities_arr,
+        'final_utilities': final_utilities,
+        'objective_history': objective_history,
+        'q_nee_group': q_nee_group,
+        'q_nee_individual': q_nee_individual,
+        'attacking_group': attacking_group,
+        'defending_group': defending_group,
+    }
+    
+    return optimal_constraints if optimal_constraints else None, info
 
 
 # =============================================================================

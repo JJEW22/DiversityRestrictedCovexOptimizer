@@ -23,6 +23,86 @@ from nash_welfare_optimizer import (
 )
 
 
+def parse_preference_vector(pref_str: str, normalize: bool = True) -> np.ndarray:
+    """Parse a comma-separated preference string into a numpy array.
+    
+    Args:
+        pref_str: Comma-separated string of values
+        normalize: If True, normalize so values sum to 1
+    """
+    values = [float(x.strip()) for x in pref_str.split(',')]
+    arr = np.array(values)
+    
+    if normalize:
+        total = np.sum(arr)
+        if total > 1e-10:
+            arr = arr / total
+    
+    return arr
+
+
+def parse_defender_prefs(pref_str: str, n_resources: int, normalize: bool = True) -> List[np.ndarray]:
+    """
+    Parse defender preferences. Can be:
+    - Single preference: "1.0,0.0,0.0" (all defenders have same preference)
+    - Multiple preferences separated by semicolons: "1,0,0;0,1,0;0,0,1" (cycle through)
+    """
+    if ';' in pref_str:
+        prefs = []
+        for part in pref_str.split(';'):
+            pref = parse_preference_vector(part.strip(), normalize=normalize)
+            if len(pref) != n_resources:
+                raise ValueError(f"Preference vector {pref} has wrong length (expected {n_resources})")
+            prefs.append(pref)
+        return prefs
+    else:
+        pref = parse_preference_vector(pref_str, normalize=normalize)
+        if len(pref) != n_resources:
+            raise ValueError(f"Preference vector {pref} has wrong length (expected {n_resources})")
+        return [pref]
+
+
+def create_custom_setup_3d(
+    attacker_prefs: np.ndarray,
+    defender_prefs: List[np.ndarray],
+    n_defenders: int,
+    n_resources: int = 3,
+):
+    """
+    Create a test setup with custom preferences.
+    
+    Args:
+        attacker_prefs: Preference vector for the attacker (should be normalized)
+        defender_prefs: List of preference vectors for defenders (cycled if fewer than n_defenders)
+        n_defenders: Number of defender agents
+        n_resources: Number of resources (must match preference vector lengths)
+    
+    Returns:
+        utilities, supply, attacking_group, victim_group, attacker_id, n_agents, n_resources
+    """
+    n_agents = n_defenders + 1  # defenders + 1 attacker
+    
+    utilities = np.zeros((n_agents, n_resources))
+    
+    # Set defender preferences (cycle through defender_prefs if needed)
+    for i in range(n_defenders):
+        pref_idx = i % len(defender_prefs)
+        utilities[i] = defender_prefs[pref_idx]
+    
+    # Set attacker preferences (last agent)
+    attacker_id = n_agents - 1
+    utilities[attacker_id] = attacker_prefs
+    
+    # Supply: 1 unit of each resource (same as original)
+    supply = np.ones(n_resources)
+    
+    # Groups
+    attacking_group = {attacker_id}
+    victim_group = set(range(n_defenders))
+    
+    return utilities, supply, attacking_group, victim_group, attacker_id, n_agents, n_resources
+
+
 def create_test_setup_3d(n_agents: int = 10, random_utilities: bool = False, seed: Optional[int] = None):
     """Create a test setup with 3 resources.
     
@@ -436,6 +516,15 @@ def probe_direction_3d(
         result['attacker_ratios'] = attacker_ratios
         result['dependent_ratios'] = dependent_ratios
         result['dependent_agents'] = dependent_agents
+        
+        # Compute non-attacker utilities at max (which is the boundary in this case)
+        V_max = np.array([np.dot(utilities[i], x_full_max[i]) for i in range(n_agents)])
+        non_attacker_utilities = {i: V_max[i] for i in non_attacking_group}
+        result['non_attacker_utilities'] = non_attacker_utilities
+        result['total_non_attacker_utility'] = sum(non_attacker_utilities.values())
+        result['min_non_attacker_utility'] = min(non_attacker_utilities.values()) if non_attacker_utilities else 0.0
+        result['non_attacker_nash_welfare'] = np.prod([V_max[i] for i in non_attacking_group])
+        
         return result
     
     # Binary search to find boundary
@@ -558,6 +647,14 @@ def probe_direction_3d(
         result['attacker_ratios'] = attacker_ratios
         result['dependent_ratios'] = dependent_ratios
         result['dependent_agents'] = dependent_agents
+        
+        # Compute non-attacker utilities at boundary
+        V_boundary = np.array([np.dot(utilities[i], x_full_boundary[i]) for i in range(n_agents)])
+        non_attacker_utilities = {i: V_boundary[i] for i in non_attacking_group}
+        result['non_attacker_utilities'] = non_attacker_utilities
+        result['total_non_attacker_utility'] = sum(non_attacker_utilities.values())
+        result['min_non_attacker_utility'] = min(non_attacker_utilities.values()) if non_attacker_utilities else 0.0
+        result['non_attacker_nash_welfare'] = np.prod([V_boundary[i] for i in non_attacking_group])
     
     return result
 
@@ -762,10 +859,14 @@ def validate_all_boundary_points(boundary_points: List[np.ndarray],
 
 
 def plot_boundary_3d(results: List[Tuple[float, float, Dict]], filename: str, 
-                     optimum_result: Optional[Tuple[np.ndarray, np.ndarray, bool]] = None):
+                     optimum_result: Optional[Tuple[np.ndarray, np.ndarray, bool]] = None,
+                     supply: Optional[np.ndarray] = None):
     """Plot the boundary points in 3D with normal vectors, colored by validation status."""
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
+    
+    # Use fixed max_range of 1.0 (unit supply)
+    max_range = 1.0
     
     boundary_points = []
     normal_vectors = []
@@ -851,8 +952,7 @@ def plot_boundary_3d(results: List[Tuple[float, float, Dict]], filename: str,
     ax.set_title('Boundary Surface Probe (3D)\n(Attacker Allocation Space)')
     ax.legend()
     
-    # Set equal aspect ratio
-    max_range = 1.0
+    # Set equal aspect ratio (max_range already set at top of function from supply)
     ax.set_xlim(0, max_range)
     ax.set_ylim(0, max_range)
     ax.set_zlim(0, max_range)
@@ -863,17 +963,157 @@ def plot_boundary_3d(results: List[Tuple[float, float, Dict]], filename: str,
     plt.show()
 
 
+def plot_non_attacker_utility_surfaces(results: List[Tuple[float, float, Dict]], filename_prefix: str):
+    """
+    Plot 3D surfaces showing non-attacker utilities as a function of normalized attacker direction.
+    
+    Creates two plots:
+    1. Total non-attacker utility (sum) vs normalized direction
+    2. Minimum non-attacker utility vs normalized direction
+    
+    X, Y are the first two components of the normalized boundary allocation (sums to 1, on simplex)
+    Z is the utility metric at the boundary point x*
+    """
+    # Collect data points
+    simplex_x = []  # First component of normalized boundary allocation
+    simplex_y = []  # Second component of normalized boundary allocation
+    total_utilities = []
+    min_utilities = []
+    nash_welfares = []
+    
+    for phi, theta, result in results:
+        if result['boundary_attacker_alloc'] is not None and result.get('total_non_attacker_utility') is not None:
+            # Get the boundary allocation and normalize to sum to 1 (simplex)
+            boundary_alloc = result['boundary_attacker_alloc']
+            alloc_sum = np.sum(boundary_alloc)
+            if alloc_sum > 1e-10:
+                normalized_alloc = boundary_alloc / alloc_sum
+                simplex_x.append(normalized_alloc[0])
+                simplex_y.append(normalized_alloc[1])
+                total_utilities.append(result['total_non_attacker_utility'])
+                min_utilities.append(result['min_non_attacker_utility'])
+                nash_welfares.append(result.get('non_attacker_nash_welfare', 0.0))
+    
+    if not simplex_x:
+        print("No valid data points for non-attacker utility plots")
+        return
+    
+    simplex_x = np.array(simplex_x)
+    simplex_y = np.array(simplex_y)
+    total_utilities = np.array(total_utilities)
+    min_utilities = np.array(min_utilities)
+    nash_welfares = np.array(nash_welfares)
+    
+    # Plot 1: Total non-attacker utility
+    fig1 = plt.figure(figsize=(12, 10))
+    ax1 = fig1.add_subplot(111, projection='3d')
+    
+    scatter1 = ax1.scatter(simplex_x, simplex_y, total_utilities, 
+                           c=total_utilities, cmap='viridis', s=50)
+    
+    ax1.set_xlabel('Normalized Boundary Alloc[0]')
+    ax1.set_ylabel('Normalized Boundary Alloc[1]')
+    ax1.set_zlabel('Total Non-Attacker Utility')
+    ax1.set_title('Total Non-Attacker Utility vs Attacker Boundary Allocation\n(Allocation normalized to sum to 1)')
+    fig1.colorbar(scatter1, ax=ax1, label='Total Utility')
+    
+    plt.tight_layout()
+    filename1 = f"{filename_prefix}_total_utility.png"
+    plt.savefig(filename1, dpi=150)
+    print(f"Total utility plot saved to {filename1}")
+    plt.show()
+    
+    # Plot 2: Minimum non-attacker utility
+    fig2 = plt.figure(figsize=(12, 10))
+    ax2 = fig2.add_subplot(111, projection='3d')
+    
+    scatter2 = ax2.scatter(simplex_x, simplex_y, min_utilities, 
+                           c=min_utilities, cmap='plasma', s=50)
+    
+    ax2.set_xlabel('Normalized Boundary Alloc[0]')
+    ax2.set_ylabel('Normalized Boundary Alloc[1]')
+    ax2.set_zlabel('Min Non-Attacker Utility')
+    ax2.set_title('Minimum Non-Attacker Utility vs Attacker Boundary Allocation\n(Allocation normalized to sum to 1)')
+    fig2.colorbar(scatter2, ax=ax2, label='Min Utility')
+    
+    plt.tight_layout()
+    filename2 = f"{filename_prefix}_min_utility.png"
+    plt.savefig(filename2, dpi=150)
+    print(f"Min utility plot saved to {filename2}")
+    plt.show()
+    
+    # Plot 3: Non-attacker Nash welfare (product of utilities)
+    fig3 = plt.figure(figsize=(12, 10))
+    ax3 = fig3.add_subplot(111, projection='3d')
+    
+    # Use log scale for Nash welfare since it can vary widely
+    log_nash = np.log(nash_welfares + 1e-20)
+    
+    scatter3 = ax3.scatter(simplex_x, simplex_y, log_nash, 
+                           c=log_nash, cmap='coolwarm', s=50)
+    
+    ax3.set_xlabel('Normalized Boundary Alloc[0]')
+    ax3.set_ylabel('Normalized Boundary Alloc[1]')
+    ax3.set_zlabel('Log(Non-Attacker Nash Welfare)')
+    ax3.set_title('Non-Attacker Nash Welfare vs Attacker Boundary Allocation\n(Allocation normalized to sum to 1)')
+    fig3.colorbar(scatter3, ax=ax3, label='Log(Nash Welfare)')
+    
+    plt.tight_layout()
+    filename3 = f"{filename_prefix}_nash_welfare.png"
+    plt.savefig(filename3, dpi=150)
+    print(f"Nash welfare plot saved to {filename3}")
+    plt.show()
+    
+    # Print summary statistics
+    print()
+    print("=" * 60)
+    print("NON-ATTACKER UTILITY STATISTICS")
+    print("=" * 60)
+    print(f"Number of data points: {len(total_utilities)}")
+    print()
+    print("Total Non-Attacker Utility:")
+    print(f"  Min: {np.min(total_utilities):.6f}")
+    print(f"  Max: {np.max(total_utilities):.6f}")
+    print(f"  Mean: {np.mean(total_utilities):.6f}")
+    print()
+    print("Minimum Non-Attacker Utility:")
+    print(f"  Min: {np.min(min_utilities):.6f}")
+    print(f"  Max: {np.max(min_utilities):.6f}")
+    print(f"  Mean: {np.mean(min_utilities):.6f}")
+    print()
+    print("Non-Attacker Nash Welfare:")
+    print(f"  Min: {np.min(nash_welfares):.6e}")
+    print(f"  Max: {np.max(nash_welfares):.6e}")
+    print(f"  Mean: {np.mean(nash_welfares):.6e}")
+    
+    # Find the boundary allocation that minimizes non-attacker welfare (worst for defenders)
+    worst_idx = np.argmin(nash_welfares)
+    print()
+    print("Boundary allocation that MINIMIZES non-attacker Nash welfare (worst for defenders):")
+    print(f"  Normalized allocation: [{simplex_x[worst_idx]:.4f}, {simplex_y[worst_idx]:.4f}, {1-simplex_x[worst_idx]-simplex_y[worst_idx]:.4f}]")
+    print(f"  Nash welfare: {nash_welfares[worst_idx]:.6e}")
+    print(f"  Min utility: {min_utilities[worst_idx]:.6f}")
+    print(f"  Total utility: {total_utilities[worst_idx]:.6f}")
+
+
 def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Probe boundary surface in 3D')
-    parser.add_argument('--n-agents', type=int, default=10, help='Number of agents')
+    parser.add_argument('--n-agents', type=int, default=10, help='Number of agents (ignored if using custom prefs)')
     parser.add_argument('--n-phi', type=int, default=8, help='Number of phi divisions')
     parser.add_argument('--n-theta', type=int, default=16, help='Number of theta divisions')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--output-dir', type=str, default='.', help='Output directory')
     parser.add_argument('--random-utilities', action='store_true', help='Use random utilities instead of hardcoded')
     parser.add_argument('--seed', type=int, default=None, help='Random seed (only used with --random-utilities)')
+    # Custom preference arguments
+    parser.add_argument('--attacker-prefs', type=str, default=None,
+                        help='Custom attacker preferences (comma-separated, e.g., "0.9,0.1,0.0")')
+    parser.add_argument('--defender-prefs', type=str, default=None,
+                        help='Custom defender preferences. Single: "1,0,0". Multiple (cycled): "1,0,0;0,1,0;0,0,1"')
+    parser.add_argument('--n-defenders', type=int, default=None,
+                        help='Number of defenders (required if using custom prefs)')
     
     args = parser.parse_args()
     
@@ -881,17 +1121,57 @@ def main():
     print("3D BOUNDARY SURFACE PROBE")
     print("=" * 60)
     
-    # Setup
-    utilities, supply, attacking_group, victim_group, attacker_id, n_agents, n_resources = \
-        create_test_setup_3d(args.n_agents, random_utilities=args.random_utilities, seed=args.seed)
+    # Check if using custom preferences
+    use_custom = args.attacker_prefs is not None or args.defender_prefs is not None
+    
+    if use_custom:
+        if args.attacker_prefs is None or args.defender_prefs is None or args.n_defenders is None:
+            print("Error: When using custom preferences, must specify --attacker-prefs, --defender-prefs, and --n-defenders")
+            return
+        
+        n_resources = 3
+        
+        # Parse raw first to show what was input
+        attacker_prefs_raw = parse_preference_vector(args.attacker_prefs, normalize=False)
+        attacker_prefs = parse_preference_vector(args.attacker_prefs, normalize=True)
+        if len(attacker_prefs) != n_resources:
+            print(f"Error: Attacker preferences must have {n_resources} values, got {len(attacker_prefs)}")
+            return
+        
+        defender_prefs_raw = parse_defender_prefs(args.defender_prefs, n_resources, normalize=False)
+        defender_prefs = parse_defender_prefs(args.defender_prefs, n_resources, normalize=True)
+        
+        print()
+        print("CUSTOM PREFERENCES MODE")
+        print()
+        print("Input preferences (raw):")
+        print(f"  Attacker: {attacker_prefs_raw.round(6)}")
+        for i, pref in enumerate(defender_prefs_raw):
+            print(f"  Defender pattern {i}: {pref.round(6)}")
+        
+        print()
+        print("Normalized preferences (sum to 1):")
+        print(f"  Attacker: {attacker_prefs.round(6)}")
+        for i, pref in enumerate(defender_prefs):
+            print(f"  Defender pattern {i}: {pref.round(6)}")
+        print()
+        
+        utilities, supply, attacking_group, victim_group, attacker_id, n_agents, n_resources = \
+            create_custom_setup_3d(attacker_prefs, defender_prefs, args.n_defenders, n_resources)
+    else:
+        # Setup using original method
+        utilities, supply, attacking_group, victim_group, attacker_id, n_agents, n_resources = \
+            create_test_setup_3d(args.n_agents, random_utilities=args.random_utilities, seed=args.seed)
     
     non_attacking_group = set(range(n_agents)) - attacking_group
     
     print(f"n_agents: {n_agents}")
     print(f"n_resources: {n_resources}")
-    print(f"random_utilities: {args.random_utilities}")
-    if args.seed is not None:
-        print(f"seed: {args.seed}")
+    if not use_custom:
+        print(f"random_utilities: {args.random_utilities}")
+        if args.seed is not None:
+            print(f"seed: {args.seed}")
+    print(f"supply: {supply}")
     print(f"Attacker (Agent {attacker_id}): utilities = {utilities[attacker_id].round(6)}")
     print(f"Non-attacker utilities:")
     for i in range(min(5, n_agents - 1)):
@@ -1048,7 +1328,11 @@ def main():
     
     # Plot
     plot_filename = f"{args.output_dir}/boundary_probe_3d_n{args.n_agents}.png"
-    plot_boundary_3d(results, plot_filename, optimum_result=optimum_plot_data)
+    plot_boundary_3d(results, plot_filename, optimum_result=optimum_plot_data, supply=supply)
+    
+    # Plot non-attacker utility surfaces
+    utility_plot_prefix = f"{args.output_dir}/boundary_probe_3d_n{args.n_agents}_non_attacker"
+    plot_non_attacker_utility_surfaces(results, utility_plot_prefix)
     
     # Summary
     print()
