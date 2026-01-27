@@ -20,6 +20,7 @@ Logs results to spreadsheet every 6 simulations.
 import numpy as np
 import time
 import itertools
+import warnings
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass, field
 import os
@@ -69,6 +70,12 @@ class SimulationResult:
     nash_welfare_qnee_worst_final: float
     defender_welfare_initial: float
     defender_welfare_qnee_worst_final: float
+    
+    # Warning tracking
+    pmon_had_warnings: bool = False
+    qnee_had_warnings: bool = False
+    pmon_warning_types: List[str] = field(default_factory=list)
+    qnee_warning_types: List[str] = field(default_factory=list)
 
 
 def generate_utilities_rod_cutting(n_agents: int, n_resources: int, seed: int) -> np.ndarray:
@@ -143,22 +150,31 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         print(f"  Defenders: {defending_group}")
         print(f"  Non-attackers: {non_attacking_group}")
     
+    # Warning tracking
+    pmon_warnings = []
+    qnee_warnings = []
+    
     # =========================================================================
     # Part 1: p-MON optimization (best constraint for attackers)
     # =========================================================================
     pmon_start = time.perf_counter()
     
     try:
-        constraints, info = compute_optimal_self_benefit_constraint(
-            utilities=utilities,
-            attacking_group=attacking_group,
-            victim_group=defending_group if defending_group else None,
-            supply=supply,
-            verbose=verbose or debug,
-            debug=debug,
-            use_projection=use_projection,
-            use_integral_method=use_integral_method,
-        )
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            constraints, info = compute_optimal_self_benefit_constraint(
+                utilities=utilities,
+                attacking_group=attacking_group,
+                victim_group=defending_group if defending_group else None,
+                supply=supply,
+                verbose=verbose or debug,
+                debug=debug,
+                use_projection=use_projection,
+                use_integral_method=use_integral_method,
+            )
+            # Capture any warnings that were issued
+            for w in caught_warnings:
+                pmon_warnings.append(f"p-MON:{w.category.__name__}:{str(w.message)}")
         
         V_initial = info['initial_utilities']
         V_pmon_final = info['final_utilities']
@@ -182,6 +198,7 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         V_pmon_final = V_initial.copy()
         pmon_converged = False
         pmon_n_iterations = 0
+        pmon_warnings.append(f"p-MON:Exception:{str(e)}")
     
     pmon_time = time.perf_counter() - pmon_start
     
@@ -226,16 +243,21 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
     qnee_start = time.perf_counter()
     
     try:
-        qnee_constraints, qnee_info = solve_optimal_harm_constraint_pgd(
-            utilities=utilities,
-            attacking_group=attacking_group,
-            defending_group=defending_group,
-            supply=supply,
-            max_iterations=pgd_max_iterations,
-            step_size=pgd_step_size,
-            verbose=verbose or debug,
-            debug=debug,
-        )
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always")
+            qnee_constraints, qnee_info = solve_optimal_harm_constraint_pgd(
+                utilities=utilities,
+                attacking_group=attacking_group,
+                defending_group=defending_group,
+                supply=supply,
+                max_iterations=pgd_max_iterations,
+                step_size=pgd_step_size,
+                verbose=verbose or debug,
+                debug=debug,
+            )
+            # Capture any warnings that were issued
+            for w in caught_warnings:
+                qnee_warnings.append(f"q-NEE:{w.category.__name__}:{str(w.message)}")
         
         V_qnee_worst_final = qnee_info['final_utilities']
         qnee_worst_converged = qnee_info['converged']
@@ -256,6 +278,7 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         qnee_worst_converged = False
         qnee_worst_iterations = 0
         defender_welfare_qnee_worst_final = defender_welfare_initial
+        qnee_warnings.append(f"q-NEE:Exception:{str(e)}")
     
     qnee_time = time.perf_counter() - qnee_start
     
@@ -327,6 +350,11 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         nash_welfare_qnee_worst_final=nash_welfare_qnee_worst_final,
         defender_welfare_initial=defender_welfare_initial,
         defender_welfare_qnee_worst_final=defender_welfare_qnee_worst_final,
+        # Warning tracking
+        pmon_had_warnings=len(pmon_warnings) > 0,
+        qnee_had_warnings=len(qnee_warnings) > 0,
+        pmon_warning_types=pmon_warnings,
+        qnee_warning_types=qnee_warnings,
     )
 
 
@@ -337,6 +365,10 @@ def results_to_rows(results: List[SimulationResult], n_agents: int = 10) -> List
         # Format groups with semicolons to avoid CSV delimiter issues
         attacking_group_str = ";".join(str(x) for x in sorted(r.attacking_group))
         defending_group_str = ";".join(str(x) for x in sorted(r.defending_group))
+        
+        # Format warning types with semicolons
+        pmon_warning_types_str = ";".join(r.pmon_warning_types) if r.pmon_warning_types else ""
+        qnee_warning_types_str = ";".join(r.qnee_warning_types) if r.qnee_warning_types else ""
         
         row = {
             'attacker_size': r.attacker_size,
@@ -365,6 +397,12 @@ def results_to_rows(results: List[SimulationResult], n_agents: int = 10) -> List
             'nash_welfare_qnee_worst_final': r.nash_welfare_qnee_worst_final,
             'defender_welfare_initial': r.defender_welfare_initial,
             'defender_welfare_qnee_worst_final': r.defender_welfare_qnee_worst_final,
+            
+            # Warning tracking
+            'pmon_had_warnings': r.pmon_had_warnings,
+            'qnee_had_warnings': r.qnee_had_warnings,
+            'pmon_warning_types': pmon_warning_types_str,
+            'qnee_warning_types': qnee_warning_types_str,
         }
         
         # Add individual V_initial values
