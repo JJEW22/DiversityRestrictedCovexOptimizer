@@ -3629,6 +3629,7 @@ def compute_optimal_self_benefit_constraint(
     import time
     timing_info = {}
     debug_info = {}
+    warnings_list = []  # Track warnings for return info
     
     # Debug implies verbose
     if debug:
@@ -3831,6 +3832,8 @@ def compute_optimal_self_benefit_constraint(
         allocations_match = allocation_diff_norm < 1e-4
         
         if not allocations_match:
+            warning_msg = f"Final allocation differs from convex program allocation (diff norm: {allocation_diff_norm:.6e})"
+            warnings_list.append(warning_msg)
             print(f"[WARNING] Final allocation differs from convex program allocation!")
             print(f"[WARNING]   Allocation difference norm: {allocation_diff_norm:.6e}")
             print(f"[WARNING]   Utility difference norm: {utility_diff_norm:.6e}")
@@ -3982,6 +3985,8 @@ def compute_optimal_self_benefit_constraint(
         'cp_directional_deriv': cp_directional_deriv,
         'final_on_boundary': final_on_boundary,
         'final_directional_deriv': final_directional_deriv,
+        # Warnings
+        'warnings': warnings_list,
     }
     
     return optimal_constraints, info
@@ -4519,6 +4524,12 @@ def solve_optimal_harm_constraint_pgd(
     objective_history = [initial_defender_welfare]
     converged = False
     final_iteration = 0
+    warnings_list = []  # Track warnings for return info
+    
+    # Track minimum defender welfare point seen (in case we walk uphill)
+    min_defender_welfare = initial_defender_welfare
+    min_welfare_allocation = x_current.copy()
+    min_welfare_iteration = 0
     
     # Non-defenders = everyone except defenders (includes attackers)
     non_defending_group = set(range(n_agents)) - defending_group
@@ -4662,7 +4673,9 @@ def solve_optimal_harm_constraint_pgd(
         # Sanity check: verify swap optimality
         swap_violated, _, _ = swap_oracle.is_violated(x_projected.flatten())
         if swap_violated:
-            print(f"[PGD WARNING] Iteration {iteration}: Swap optimality violated after projection!")
+            warning_msg = f"Iteration {iteration}: Swap optimality violated after projection"
+            warnings_list.append(warning_msg)
+            print(f"[PGD WARNING] {warning_msg}!")
         
         # Print allocations before computing new defender welfare (only in debug mode)
         if debug:
@@ -4680,11 +4693,37 @@ def solve_optimal_harm_constraint_pgd(
         new_defender_welfare = compute_defender_welfare(x_projected)
         objective_history.append(new_defender_welfare)
         
+        # Track minimum defender welfare point seen
+        if new_defender_welfare < min_defender_welfare:
+            min_defender_welfare = new_defender_welfare
+            min_welfare_allocation = x_projected.copy()
+            min_welfare_iteration = iteration
+        
+        # Check directional derivative at the projected point
+        # If >= 0.001, we may be in the interior (not on/beyond optimal boundary)
+        x_projected_full = x_projected.reshape((n_agents, n_resources))
+        V_projected = compute_utilities_arr(x_projected)
+        forward_direction, forward_valid = dir_deriv_oracle._compute_direction(x_projected_full, V_projected, backward=False)
+        if forward_valid:
+            dir_deriv_value = dir_deriv_oracle._compute_directional_derivative_with_direction(x_projected_full, V_projected, forward_direction)
+        else:
+            backward_direction, _ = dir_deriv_oracle._compute_direction(x_projected_full, V_projected, backward=True)
+            backward_deriv = dir_deriv_oracle._compute_directional_derivative_with_direction(x_projected_full, V_projected, backward_direction)
+            dir_deriv_value = -backward_deriv
+        
+        if dir_deriv_value >= 0.001:
+            warning_msg = f"Iteration {iteration}: Directional derivative {dir_deriv_value:.6f} >= 0.001 (may be in interior)"
+            warnings_list.append(warning_msg)
+            if verbose:
+                print(f"[PGD WARNING] {warning_msg}")
+        
         # Warning if we moved in the wrong direction (welfare increased instead of decreased)
         # Only warn if the increase is significant (> 0.1% relative increase)
         improvement = objective_history[-2] - objective_history[-1]
         relative_increase = -improvement / max(abs(objective_history[-2]), 1e-10)
         if relative_increase > 1e-3:  # More than 0.1% increase
+            warning_msg = f"Iteration {iteration}: Moved in WRONG direction! Welfare increased by {relative_increase*100:.2f}%"
+            warnings_list.append(warning_msg)
             print(f"[PGD WARNING] Iteration {iteration}: Moved in WRONG direction! Defender welfare INCREASED.")
             print(f"[PGD WARNING]   Previous welfare: {objective_history[-2]:.6e}")
             print(f"[PGD WARNING]   New welfare: {objective_history[-1]:.6e}")
@@ -4714,6 +4753,12 @@ def solve_optimal_harm_constraint_pgd(
     
     if not converged and verbose:
         print(f"[PGD] Did not converge after {max_iterations} iterations")
+    
+    # Use the minimum defender welfare point seen (in case we walked uphill)
+    if min_defender_welfare < compute_defender_welfare(x_current):
+        if verbose:
+            print(f"[PGD] Using minimum welfare point from iteration {min_welfare_iteration} (welfare {min_defender_welfare:.6e}) instead of final point")
+        x_current = min_welfare_allocation.copy()
     
     # Cleanup step: redistribute items that non-attackers don't value
     # For each non-attacker, if they have allocation of an item they don't value (v_{i,j} = 0),
@@ -4914,6 +4959,8 @@ def solve_optimal_harm_constraint_pgd(
         'q_nee_individual': q_nee_individual,
         'attacking_group': attacking_group,
         'defending_group': defending_group,
+        'warnings': warnings_list,
+        'min_welfare_iteration': min_welfare_iteration,
     }
     
     return optimal_constraints if optimal_constraints else None, info

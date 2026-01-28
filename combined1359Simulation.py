@@ -20,7 +20,6 @@ Logs results to spreadsheet every 6 simulations.
 import numpy as np
 import time
 import itertools
-import warnings
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import dataclass, field
 import os
@@ -160,21 +159,19 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
     pmon_start = time.perf_counter()
     
     try:
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            warnings.simplefilter("always")
-            constraints, info = compute_optimal_self_benefit_constraint(
-                utilities=utilities,
-                attacking_group=attacking_group,
-                victim_group=defending_group if defending_group else None,
-                supply=supply,
-                verbose=verbose or debug,
-                debug=debug,
-                use_projection=use_projection,
-                use_integral_method=use_integral_method,
-            )
-            # Capture any warnings that were issued
-            for w in caught_warnings:
-                pmon_warnings.append(f"p-MON:{w.category.__name__}:{str(w.message)}")
+        constraints, info = compute_optimal_self_benefit_constraint(
+            utilities=utilities,
+            attacking_group=attacking_group,
+            victim_group=defending_group if defending_group else None,
+            supply=supply,
+            verbose=verbose or debug,
+            debug=debug,
+            use_projection=use_projection,
+            use_integral_method=use_integral_method,
+        )
+        
+        # Capture warnings from the return info
+        pmon_warnings = info.get('warnings', [])
         
         V_initial = info['initial_utilities']
         V_pmon_final = info['final_utilities']
@@ -198,7 +195,7 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         V_pmon_final = V_initial.copy()
         pmon_converged = False
         pmon_n_iterations = 0
-        pmon_warnings.append(f"p-MON:Exception:{str(e)}")
+        pmon_warnings.append(f"Exception:{str(e)}")
     
     pmon_time = time.perf_counter() - pmon_start
     
@@ -243,21 +240,19 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
     qnee_start = time.perf_counter()
     
     try:
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            warnings.simplefilter("always")
-            qnee_constraints, qnee_info = solve_optimal_harm_constraint_pgd(
-                utilities=utilities,
-                attacking_group=attacking_group,
-                defending_group=defending_group,
-                supply=supply,
-                max_iterations=pgd_max_iterations,
-                step_size=pgd_step_size,
-                verbose=verbose or debug,
-                debug=debug,
-            )
-            # Capture any warnings that were issued
-            for w in caught_warnings:
-                qnee_warnings.append(f"q-NEE:{w.category.__name__}:{str(w.message)}")
+        qnee_constraints, qnee_info = solve_optimal_harm_constraint_pgd(
+            utilities=utilities,
+            attacking_group=attacking_group,
+            defending_group=defending_group,
+            supply=supply,
+            max_iterations=pgd_max_iterations,
+            step_size=pgd_step_size,
+            verbose=verbose or debug,
+            debug=debug,
+        )
+        
+        # Capture warnings from the return info
+        qnee_warnings = qnee_info.get('warnings', [])
         
         V_qnee_worst_final = qnee_info['final_utilities']
         qnee_worst_converged = qnee_info['converged']
@@ -278,7 +273,7 @@ def run_simulation(attacker_size: int, defender_size: int, n_resources: int,
         qnee_worst_converged = False
         qnee_worst_iterations = 0
         defender_welfare_qnee_worst_final = defender_welfare_initial
-        qnee_warnings.append(f"q-NEE:Exception:{str(e)}")
+        qnee_warnings.append(f"Exception:{str(e)}")
     
     qnee_time = time.perf_counter() - qnee_start
     
@@ -544,6 +539,10 @@ def main():
     parser.add_argument("--pgd-step-size", type=float, default=0.1, dest="pgd_step_size",
                         help="Step size for PGD (default: 0.1)")
     
+    # Seed adjustment
+    parser.add_argument("--seed-adjustment", type=str, default="", dest="seed_adjustment",
+                        help="String to concatenate to each seed (e.g., '1' turns seed 11000 into 110001)")
+    
     args = parser.parse_args()
     
     # Parse boolean arguments
@@ -553,6 +552,15 @@ def main():
     # Generate configurations
     configs = generate_configurations()
     
+    # Apply seed adjustment (concatenation) if provided
+    if args.seed_adjustment:
+        adjusted_configs = []
+        for att_size, def_size, n_resources, seed in configs:
+            # Concatenate: seed 11000 with adjustment "1" becomes 110001
+            adjusted_seed = int(str(seed) + args.seed_adjustment)
+            adjusted_configs.append((att_size, def_size, n_resources, adjusted_seed))
+        configs = adjusted_configs
+    
     print("=" * 70)
     print("p-MON / q-NEE Simulation with Worst-Case q-NEE")
     print("=" * 70)
@@ -560,6 +568,8 @@ def main():
     print(f"Output folder: {args.output_folder}")
     print(f"File prefix: {args.prefix}")
     print(f"Save interval: every {args.save_interval} simulations")
+    if args.seed_adjustment:
+        print(f"Seed adjustment: '{args.seed_adjustment}' (concatenated)")
     print(f"Method settings:")
     print(f"  use_projection: {use_projection}")
     print(f"  use_integral_method: {use_integral_method}")
