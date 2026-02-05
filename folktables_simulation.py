@@ -1082,7 +1082,7 @@ def results_to_rows(results: List[FolktablesSimulationResult]) -> List[Dict]:
         gini_individual_str = ";".join(f"{r.gini_individual.get(i, 0.0):.6f}" for i in range(r.n_jobs))
         
         row = {
-            'n_jobs': r.n_jobs,
+            'n_agents': r.n_jobs,  # Total number of agents (jobs)
             'n_buckets': r.n_buckets,
             'n_unique_jobs': r.n_unique_jobs,
             'n_buckets_found': r.n_buckets_found,
@@ -1867,6 +1867,7 @@ def main():
     
     print()
     print(f"Census data loaded:")
+    print(f"  Total individuals in dataset: {len(census_data.df):,}")
     print(f"  Total jobs available: {len(census_data.job_weights)}")
     print()
     
